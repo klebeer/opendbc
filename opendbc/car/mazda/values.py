@@ -188,6 +188,8 @@ class WMI(StrEnum):
   JAPAN_PASSENGER = "JM1"   # Japan-built passenger cars
   JAPAN_CROSSOVER = "JM3"   # Japan-built crossovers
   MEXICO_PASSENGER = "3MZ"  # Mazda de Mexico (Mazda 3)
+  # Japan-built crossovers for markets outside North America.
+  EXPORT_CROSSOVER = "JM7"
   # Export VINs without a model-year field use the EPS-swap fallback.
   OCEANIA_EXPORT = "JM0"
 
@@ -239,7 +241,7 @@ class CAR(Platforms):
   MAZDA_CX5_2022 = MazdaPlatformConfig(
     [MazdaCarDocs("Mazda CX-5 2022-25")],
     MazdaCX5_2022CarSpecs(mass=3728 * CV.LB_TO_KG, wheelbase=2.698, steerRatio=18.1),  # 15.5 is factory spec; 18.1 from paramsd learner (2.9M samples)
-    wmis={WMI.JAPAN_CROSSOVER}, chassis_codes={'KF'}, years={'N', 'P', 'R', 'S'},  # 2022-25
+    wmis={WMI.JAPAN_CROSSOVER, WMI.EXPORT_CROSSOVER}, chassis_codes={'KF'}, years={'N', 'P', 'R', 'S'},  # 2022-25
   )
   MAZDA_CX8_2023 = MazdaPlatformConfig(
     [MazdaCarDocs("Mazda CX-8 2023")],

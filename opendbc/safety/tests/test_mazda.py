@@ -813,3 +813,92 @@ class TestMazdaIgnition(unittest.TestCase):
 
 if __name__ == "__main__":
   unittest.main()
+
+
+class TestMazdaNonMrcc(unittest.TestCase):
+  """A trim built without the MRCC module, declared by the platform.
+
+  Its cruise module stops publishing CRZ_CTRL a few seconds after ignition and never resumes,
+  so requiring it would invalidate the whole config for the rest of the drive. Declared, the
+  panda drops CRZ_CTRL from its checks and the cruise MODE button, which has no second mode to
+  toggle on this trim, drives the MADS button. Undeclared cars keep both.
+  """
+
+  REQUIRED = ("CRZ_BTNS", "STEER_TORQUE", "ENGINE_DATA", "PEDALS")
+
+  def setUp(self):
+    self.packer = CANPackerSafety("mazda_2017")
+    self.safety = libsafety_py.libsafety
+    self._init(non_mrcc=False)
+
+  def _init(self, non_mrcc, param=0):
+    self.safety.set_current_safety_param_sp(MazdaSafetyFlagsSP.NON_MRCC if non_mrcc else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, param)
+    self.safety.init_tests()
+    self.safety.set_mads_params(True, False, False)
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)
+    self.safety.set_mads_params(False, False, False)
+
+  def _feed(self, *names):
+    for name in names:
+      self.safety.safety_rx_hook(self.packer.make_can_msg_safety(name, 0, {}))
+
+  def _mode_button(self, pressed):
+    return self.packer.make_can_msg_safety("CRZ_BTNS", 0, {"MODE_Y": pressed})
+
+  def test_declared_config_holds_without_crz_ctrl(self):
+    # the whole point: the frame this car stops sending is not part of the checks
+    self._init(non_mrcc=True)
+    self._feed(*self.REQUIRED)
+    self.assertTrue(self.safety.safety_config_valid())
+
+  def test_undeclared_config_needs_crz_ctrl(self):
+    self._feed(*self.REQUIRED)
+    self.assertFalse(self.safety.safety_config_valid())
+    self._feed("CRZ_CTRL")
+    self.assertTrue(self.safety.safety_config_valid())
+
+  def _drive_with_crz_ctrl_silent(self):
+    """CRZ_CTRL for the first frames, then silence while the rest keeps arriving.
+
+    Three seconds, comfortably past the 1.1 s at which the check gives up on it.
+    """
+    self._feed("CRZ_CTRL", *self.REQUIRED)
+    self.assertTrue(self.safety.safety_config_valid())
+    for step in range(1, 31):
+      self.safety.set_timer(step * int(1e5))
+      self._feed(*self.REQUIRED)
+      self.safety.safety_tick_current_safety_config()
+
+  def test_declared_survives_crz_ctrl_going_stale(self):
+    self._init(non_mrcc=True)
+    self._drive_with_crz_ctrl_silent()
+    self.assertTrue(self.safety.safety_config_valid())
+
+  def test_undeclared_goes_invalid_when_crz_ctrl_goes_stale(self):
+    self._drive_with_crz_ctrl_silent()
+    self.assertFalse(self.safety.safety_config_valid())
+
+  def test_mode_button_drives_mads_when_declared(self):
+    self._init(non_mrcc=True)
+    self.safety.safety_rx_hook(self._mode_button(False))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+    self.safety.safety_rx_hook(self._mode_button(True))
+    self.assertTrue(self.safety.get_controls_allowed_lateral())
+
+  def test_mode_button_ignored_when_undeclared(self):
+    self.safety.safety_rx_hook(self._mode_button(False))
+    self.safety.safety_rx_hook(self._mode_button(True))
+    self.assertFalse(self.safety.get_controls_allowed_lateral())
+
+  def test_declared_does_not_open_the_longitudinal_tx_list(self):
+    # it reuses the longitudinal rx checks, never its transmit allowlist
+    self._init(non_mrcc=True)
+    self.safety.set_controls_allowed(True)
+    for addr in (0x21b, 0x21c, 0x361):
+      self.assertFalse(self._tx_addr(addr), f"0x{addr:x} must stay blocked")
+
+  def _tx_addr(self, addr):
+    return self.safety.safety_tx_hook(make_msg(0, addr, 8))

@@ -2,7 +2,7 @@ from opendbc.can import CANDefine, CANParser
 from opendbc.car import Bus, DT_CTRL, create_button_events, structs, uds
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
-from opendbc.car.mazda.values import DBC, LKAS_LIMITS, CarControllerParams, MazdaFlags
+from opendbc.car.mazda.values import CAR, DBC, LKAS_LIMITS, CarControllerParams, MazdaFlags
 from opendbc.sunnypilot.car.mazda.carstate_ext import CarStateExt
 from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 
@@ -295,6 +295,11 @@ class CarState(CarStateBase, CarStateExt):
       laneinfo = cp_cam.vl["CAM_LANEINFO"]
       settled = cam_laneinfo_fresh and not (laneinfo["NO_ERR_BIT"] or laneinfo["ERR_BIT"])
       self.fsc_settled_frames = self.fsc_settled_frames + 1 if settled else 0
+    elif self.CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC:
+      # Without MRCC there is no CRZ_CTRL to read, and no stock ACC to adopt: the body ECU's
+      # cruise bits carry the main switch and engagement never belongs to the car.
+      ret.cruiseState.available = cp.vl["PEDALS"]["ACC_OFF"] == 1 or cp.vl["PEDALS"]["ACC_ACTIVE"] == 1
+      ret.cruiseState.enabled = False
     else:
       # CRZ_AVAILABLE represents adaptive-cruise availability, not the main switch.
       ret.cruiseState.available = cp.vl["CRZ_CTRL"]["CRZ_AVAILABLE"] == 1
@@ -361,7 +366,14 @@ class CarState(CarStateBase, CarStateExt):
     self.resume_button = cp.vl["CRZ_BTNS"]["RES"]
     self.main_button = int(cp.vl["CRZ_BTNS"]["MODE_X"] == 1 and cp.vl["CRZ_BTNS"]["MODE_Y"] == 1)
     # Only a car declared to have the physical TJA button reports it as the MADS switch.
-    self.tja_button = int(cp.vl["CRZ_BTNS"]["TJA_BUTTON"] == 1) if self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON else 0
+    if self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON:
+      self.tja_button = int(cp.vl["CRZ_BTNS"]["TJA_BUTTON"] == 1)
+    elif self.CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC:
+      # This trim has no TJA button. Without MRCC the cruise MODE button has nothing to toggle
+      # between, so it is free to act as the lateral switch.
+      self.tja_button = int(cp.vl["CRZ_BTNS"]["MODE_Y"] == 1)
+    else:
+      self.tja_button = 0
 
     ret.buttonEvents = [
       *create_button_events(self.distance_button, prev_distance_button, {1: ButtonType.gapAdjustCruise}),
@@ -380,6 +392,11 @@ class CarState(CarStateBase, CarStateExt):
   @staticmethod
   def get_can_parsers(CP, CP_SP):
     pt_messages = []
+    if CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC:
+      # This car has no MRCC module, so CRZ_CTRL stops a fixed ~19 s after ignition. Registering
+      # it ignore_alive keeps that silence from invalidating the bus; the lazy registration
+      # behind cp.vl would otherwise give it a liveness window it can never meet.
+      pt_messages.append(("CRZ_CTRL", float("nan")))
     if CP.openpilotLongitudinalControl:
       # Do not require liveness for frames intentionally absent after radar teardown.
       pt_messages.append(("CRZ_INFO", float("nan")))

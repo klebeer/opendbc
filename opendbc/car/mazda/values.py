@@ -188,6 +188,8 @@ class WMI(StrEnum):
   JAPAN_PASSENGER = "JM1"   # Japan-built passenger cars
   JAPAN_CROSSOVER = "JM3"   # Japan-built crossovers
   MEXICO_PASSENGER = "3MZ"  # Mazda de Mexico (Mazda 3)
+  # Japan-built crossovers for markets outside North America.
+  EXPORT_CROSSOVER = "JM7"
   # Export VINs without a model-year field use the EPS-swap fallback.
   OCEANIA_EXPORT = "JM0"
 
@@ -239,7 +241,15 @@ class CAR(Platforms):
   MAZDA_CX5_2022 = MazdaPlatformConfig(
     [MazdaCarDocs("Mazda CX-5 2022-25")],
     MazdaCX5_2022CarSpecs(mass=3728 * CV.LB_TO_KG, wheelbase=2.698, steerRatio=18.1),  # 15.5 is factory spec; 18.1 from paramsd learner (2.9M samples)
-    wmis={WMI.JAPAN_CROSSOVER}, chassis_codes={'KF'}, years={'N', 'P', 'R', 'S'},  # 2022-25
+    wmis={WMI.JAPAN_CROSSOVER, WMI.EXPORT_CROSSOVER}, chassis_codes={'KF'}, years={'N', 'P', 'R', 'S'},  # 2022-25
+  )
+  MAZDA_CX5_2022_NON_MRCC = MazdaPlatformConfig(
+    [MazdaCarDocs("Mazda CX-5 Non-MRCC 2022-25")],
+    MAZDA_CX5_2022.specs,
+    # No radar on this variant, so it never claims a radar bus: radarUnavailable follows this.
+    dbc_dict={Bus.pt: 'mazda_2017'},
+    # Declares no VIN fields on purpose: the VIN resolves the chassis to MAZDA_CX5_2022 and the
+    # variant fallback redirects here, so declaring them would make platform_from_vin ambiguous.
   )
   MAZDA_CX8_2023 = MazdaPlatformConfig(
     [MazdaCarDocs("Mazda CX-8 2023")],
@@ -264,7 +274,7 @@ STEER_TO_ZERO_EPS_FW = {
 }
 
 # Platforms that ship the steer-to-zero EPS from the factory: what an unread EPS falls back to.
-STEER_TO_ZERO_PLATFORMS = frozenset({CAR.MAZDA_CX5_2022, CAR.MAZDA_CX8_2023})
+STEER_TO_ZERO_PLATFORMS = frozenset({CAR.MAZDA_CX5_2022, CAR.MAZDA_CX5_2022_NON_MRCC, CAR.MAZDA_CX8_2023})
 # Bodies supported on their stock EPS; any other Mazda needs a steer-to-zero EPS swapped in.
 SUPPORTED_PLATFORMS = STEER_TO_ZERO_PLATFORMS | {CAR.MAZDA_CX9_2021}
 
@@ -305,10 +315,34 @@ def platform_from_vin(vin: str) -> str | None:
   return str(next(iter(candidates))) if len(candidates) == 1 else None
 
 
+# Variants of one chassis, most equipped first. Each entry after the first declares a strict
+# subset of the previous entry's ECUs, so a car that cannot prove the richer equipment falls
+# through to the next one instead of failing to fingerprint.
+VIN_VARIANTS = {
+  str(CAR.MAZDA_CX5_2022): (CAR.MAZDA_CX5_2022, CAR.MAZDA_CX5_2022_NON_MRCC),
+}
+
+
+def _equipment_matches(variant, live_fw_versions, offline_fw_versions) -> bool:
+  """Every ECU the variant declares answered with a version the variant knows."""
+  expected = offline_fw_versions.get(variant)
+  if not expected:
+    return False
+  for ecu, versions in expected.items():
+    found = live_fw_versions.get(ecu[1:], set())
+    if not found or found.isdisjoint(versions):
+      return False
+  return True
+
+
 def match_fw_to_car_fuzzy(live_fw_versions, vin, offline_fw_versions) -> set[str]:
   # After firmware matching fails, require VIN fields to identify one chassis platform.
   platform = platform_from_vin(vin)
   if platform is not None:
+    for variant in VIN_VARIANTS.get(platform, ()):
+      if _equipment_matches(variant, live_fw_versions, offline_fw_versions):
+        carlog.error(f"Fingerprinted {variant} by VIN and equipment")
+        return {str(variant)}
     carlog.error(f"Fingerprinted {platform} by VIN")
     return {platform}
 

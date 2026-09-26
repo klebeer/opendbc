@@ -12,6 +12,8 @@ class MazdaSafetyFlagsSP:
   DEFAULT = 0
   # The physical TJA button is the MADS lateral switch; MRCC no longer drives the main edge.
   TJA_BUTTON = 1
+  # No MRCC module: CRZ_CTRL is absent and the MODE button is the MADS lateral switch.
+  NON_MRCC = 2
 
 
 class MazdaFlagsSP(IntFlag):

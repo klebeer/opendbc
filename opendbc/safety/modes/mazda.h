@@ -13,6 +13,11 @@
 #define MAZDA_TJA_BUTTON_BIT 11U
 // sunnypilot safety param: the TJA button is the MADS lateral switch
 #define MAZDA_PARAM_SP_TJA_BUTTON 1U
+// Cruise MODE button, DBC start bit 13. On a trim with no MRCC it has nothing to toggle
+// between, which frees it to be the lateral switch.
+#define MAZDA_MODE_Y_BIT 13U
+// sunnypilot safety param: no MRCC module, so CRZ_CTRL stops a few seconds after ignition.
+#define MAZDA_PARAM_SP_NON_MRCC 2U
 #define MAZDA_RADAR_STATIC  0x499U
 #define MAZDA_RADAR_TRACK_1 0x361U
 #define MAZDA_RADAR_TRACK_2 0x362U
@@ -45,6 +50,8 @@
 static bool mazda_longitudinal = false;
 // Declared by the driver: the TJA button owns lateral and MRCC no longer drives the main edge.
 static bool mazda_tja_button = false;
+// Declared by the platform, not the driver: the car has no MRCC module at all.
+static bool mazda_non_mrcc = false;
 static bool mazda_steer_to_zero_eps = false;
 static bool mazda_legacy_fw_eps = false;
 static uint32_t mazda_engage_btn_frames = 0U;
@@ -138,6 +145,11 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
     if ((msg->addr == MAZDA_CRZ_BTNS) && mazda_tja_button) {
       // The physical TJA button is the MADS lateral switch, so lateral no longer follows MRCC.
       mads_button_press = GET_BIT(msg, MAZDA_TJA_BUTTON_BIT) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
+    }
+
+    if ((msg->addr == MAZDA_CRZ_BTNS) && mazda_non_mrcc) {
+      // No TJA button on this trim, and no MRCC for the MODE button to switch: it owns lateral.
+      mads_button_press = GET_BIT(msg, MAZDA_MODE_Y_BIT) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
     }
 
     if ((msg->addr == MAZDA_CRZ_BTNS) && mazda_longitudinal) {
@@ -433,9 +445,13 @@ static safety_config mazda_init(uint16_t param) {
   mazda_steer_to_zero_eps = GET_FLAG(param, MAZDA_PARAM_STEER_TO_ZERO_EPS);
   mazda_legacy_fw_eps = GET_FLAG(param, MAZDA_PARAM_LEGACY_FW_EPS);
   mazda_tja_button = GET_FLAG(current_safety_param_sp, MAZDA_PARAM_SP_TJA_BUTTON);
+  mazda_non_mrcc = GET_FLAG(current_safety_param_sp, MAZDA_PARAM_SP_NON_MRCC);
   acc_main_on = false;
 
+  // A car with no MRCC never publishes CRZ_CTRL past the first seconds, so it reuses the checks
+  // the radar teardown already needs, without opening the longitudinal TX list.
   return mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_LONG_TX_MSGS) :
+         mazda_non_mrcc     ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_TX_MSGS) :
                               BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
 }
 

@@ -22,6 +22,12 @@ DIST_OBJ_MAX = 255.875    # m, the full-scale DIST_OBJ reading a track can carry
 # all, so the lead rides CRZ_CTRL alone; fully static — no counter, no checksum.
 G46L_RADAR_STATIC_MSG = (0x499, bytes.fromhex("0098400000000000"))
 
+CRZ_CTRL_ADDR = 0x21c
+# On a car without MRCC the camera publishes CRZ_CTRL, and sets DBC bit 39 (unnamed) while
+# another controller applies steering torque; the cluster chimes for as long as it is set.
+CRZ_CTRL_STEER_CHIME_BYTE = 4
+CRZ_CTRL_STEER_CHIME_MASK = 0x80
+
 
 def crz_info_checksum(dat: bytes) -> int:
   # Invert the sum of the first seven bytes, excluding STOPPING and RESUME_UNLATCHING.
@@ -184,6 +190,14 @@ def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool)
     "LDW_WARN_RL": 0,
   })
   return packer.make_can_msg("CAM_LANEINFO", 0, values)
+
+
+def create_crz_ctrl_relay(cam_frame: bytes) -> CanData:
+  # Copied raw: most of the frame has no DBC signal, and the panda accepts only a byte-exact
+  # copy of a recent camera frame.
+  dat = bytearray(cam_frame)
+  dat[CRZ_CTRL_STEER_CHIME_BYTE] &= ~CRZ_CTRL_STEER_CHIME_MASK & 0xff
+  return CanData(CRZ_CTRL_ADDR, bytes(dat), 0)
 
 
 def create_button_cmd(packer, CP, counter, button, bus=0):

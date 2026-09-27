@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from opendbc.car import Bus, get_safety_config, structs
+from opendbc.car.can_definitions import CanData
 from opendbc.car.carlog import carlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase
+from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
 from opendbc.car.mazda.radar_interface import RadarInterface
-from opendbc.car.mazda.values import DBC, G46L_RADAR_FW, LKAS_LIMITS, STEER_TO_ZERO_EPS_FW, STEER_TO_ZERO_PLATFORMS, SUPPORTED_PLATFORMS, MazdaFlags, \
+from opendbc.car.mazda.values import CAR, DBC, G46L_RADAR_FW, LKAS_LIMITS, STEER_TO_ZERO_EPS_FW, STEER_TO_ZERO_PLATFORMS, SUPPORTED_PLATFORMS, MazdaFlags, \
   MazdaSafetyFlags, platform_from_vin
 
 
@@ -93,3 +95,13 @@ class CarInterface(CarInterfaceBase):
                       "hint": "the selected platform bundle does not match the VIN's platform"})
 
     return ret
+
+  def update(self, can_packets: list[tuple[int, list[CanData]]]):
+    # The parser keeps signals only, and the CRZ_CTRL relay needs the camera's frame raw.
+    if self.CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC:
+      for _, frames in can_packets:
+        for f in frames:
+          if f.src == 2 and f.address == mazdacan.CRZ_CTRL_ADDR:
+            self.CS.cam_crz_ctrl = bytes(f.dat)
+            self.CS.cam_crz_ctrl_frames += 1
+    return super().update(can_packets)

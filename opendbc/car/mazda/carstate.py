@@ -29,6 +29,9 @@ class CarState(CarStateBase, CarStateExt):
     self.shifter_values = can_define.dv["GEAR"]["GEAR"]
 
     self.crz_btns_counter = 0
+    # The camera's raw CRZ_CTRL on a car without MRCC, captured by CarInterface.update().
+    self.cam_crz_ctrl: bytes | None = None
+    self.cam_crz_ctrl_frames = 0
     self.acc_active_last = False
     self.lkas_allowed_speed = False
     self.lkas_blocked = False

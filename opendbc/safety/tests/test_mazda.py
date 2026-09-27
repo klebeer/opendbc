@@ -820,7 +820,7 @@ class TestMazdaNonMrcc(unittest.TestCase):
 
   Its cruise module stops publishing CRZ_CTRL a few seconds after ignition and never resumes,
   so requiring it would invalidate the whole config for the rest of the drive. Declared, the
-  panda drops CRZ_CTRL from its checks and the cruise MODE button, which has no second mode to
+  panda checks the camera's CRZ_CTRL instead of the main bus's, and the cruise MODE button, which has no second mode to
   toggle on this trim, drives the MADS button. Undeclared cars keep both.
   """
 
@@ -848,11 +848,21 @@ class TestMazdaNonMrcc(unittest.TestCase):
   def _mode_button(self, pressed):
     return self.packer.make_can_msg_safety("CRZ_BTNS", 0, {"MODE_Y": pressed})
 
+  def _feed_cam_crz_ctrl(self):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRZ_CTRL", 2, {}))
+
   def test_declared_config_holds_without_crz_ctrl(self):
-    # the whole point: the frame this car stops sending is not part of the checks
+    # the whole point: the frame this car stops sending on the main bus is not part of the checks
     self._init(non_mrcc=True)
     self._feed(*self.REQUIRED)
+    self._feed_cam_crz_ctrl()
     self.assertTrue(self.safety.safety_config_valid())
+
+  def test_declared_config_needs_the_cameras_crz_ctrl(self):
+    # the relay copies it, so its absence fails closed
+    self._init(non_mrcc=True)
+    self._feed(*self.REQUIRED)
+    self.assertFalse(self.safety.safety_config_valid())
 
   def test_undeclared_config_needs_crz_ctrl(self):
     self._feed(*self.REQUIRED)
@@ -860,21 +870,25 @@ class TestMazdaNonMrcc(unittest.TestCase):
     self._feed("CRZ_CTRL")
     self.assertTrue(self.safety.safety_config_valid())
 
-  def _drive_with_crz_ctrl_silent(self):
-    """CRZ_CTRL for the first frames, then silence while the rest keeps arriving.
+  def _drive_with_crz_ctrl_silent(self, camera=False):
+    """Main-bus CRZ_CTRL for the first frames, then silence while the rest keeps arriving.
 
     Three seconds, comfortably past the 1.1 s at which the check gives up on it.
     """
     self._feed("CRZ_CTRL", *self.REQUIRED)
+    if camera:
+      self._feed_cam_crz_ctrl()
     self.assertTrue(self.safety.safety_config_valid())
     for step in range(1, 31):
       self.safety.set_timer(step * int(1e5))
       self._feed(*self.REQUIRED)
+      if camera:
+        self._feed_cam_crz_ctrl()
       self.safety.safety_tick_current_safety_config()
 
   def test_declared_survives_crz_ctrl_going_stale(self):
     self._init(non_mrcc=True)
-    self._drive_with_crz_ctrl_silent()
+    self._drive_with_crz_ctrl_silent(camera=True)
     self.assertTrue(self.safety.safety_config_valid())
 
   def test_undeclared_goes_invalid_when_crz_ctrl_goes_stale(self):
@@ -902,3 +916,96 @@ class TestMazdaNonMrcc(unittest.TestCase):
 
   def _tx_addr(self, addr):
     return self.safety.safety_tx_hook(make_msg(0, addr, 8))
+
+
+class TestMazdaNonMrccCrzCtrlRelay(unittest.TestCase):
+  """The camera's CRZ_CTRL, swapped for a copy without its steering chime bit.
+
+  On a car without MRCC the camera publishes CRZ_CTRL and sets DBC bit 39 while another
+  controller applies steering torque; the cluster chimes for as long as it stays set. While
+  openpilot steers, the panda blocks the camera's frame and accepts openpilot's in its place,
+  but only as a byte-exact copy of one of the camera's last two frames with that bit cleared.
+  """
+
+  # camera frames captured on the car (route 0000001e--eb2f9b1e95)
+  CAM_CHIME = bytes.fromhex("0201000a80000000")
+  CAM_QUIET = bytes.fromhex("0201000c00000000")
+  RELAY = bytes.fromhex("0201000a00000000")
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self._init(non_mrcc=True)
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)
+    self.safety.set_mads_params(False, False, False)
+
+  def _init(self, non_mrcc):
+    self.safety.set_current_safety_param_sp(MazdaSafetyFlagsSP.NON_MRCC if non_mrcc else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, 0)
+    self.safety.init_tests()
+    self.safety.set_mads_params(True, False, False)
+
+  def _cam(self, dat):
+    self.safety.safety_rx_hook(make_msg(2, 0x21c, 8, dat))
+
+  def _tx(self, dat):
+    return self.safety.safety_tx_hook(make_msg(0, 0x21c, 8, dat))
+
+  def _steering(self, on):
+    self.safety.set_controls_allowed_lateral(on)
+
+  def test_camera_frame_blocked_only_while_openpilot_steers(self):
+    self._steering(False)
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x21c))
+    self._steering(True)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x21c))
+
+  def test_relay_accepted_while_steering(self):
+    self._cam(self.CAM_CHIME)
+    self._steering(True)
+    self.assertTrue(self._tx(self.RELAY))
+
+  def test_relay_rejected_while_not_steering(self):
+    # the camera's own frame is forwarded then; a copy would put two on the bus
+    self._cam(self.CAM_CHIME)
+    self._steering(False)
+    self.assertFalse(self._tx(self.RELAY))
+
+  def test_relay_rejected_before_any_camera_frame(self):
+    self._steering(True)
+    self.assertFalse(self._tx(self.RELAY))
+    self.assertFalse(self._tx(bytes(8)))
+
+  def test_chime_bit_must_be_cleared(self):
+    self._cam(self.CAM_CHIME)
+    self._steering(True)
+    self.assertFalse(self._tx(self.CAM_CHIME))
+
+  def test_any_other_bit_change_is_rejected(self):
+    self._cam(self.CAM_CHIME)
+    self._steering(True)
+    for byte in range(8):
+      for bit in range(8):
+        if byte == 4 and bit == 7:
+          continue
+        dat = bytearray(self.RELAY)
+        dat[byte] ^= 1 << bit
+        self.assertFalse(self._tx(bytes(dat)), f"byte {byte} bit {bit} changed")
+
+  def test_previous_camera_frame_still_accepted(self):
+    # openpilot copies a frame or two behind the camera
+    self._cam(self.CAM_CHIME)
+    self._cam(self.CAM_QUIET)
+    self._steering(True)
+    self.assertTrue(self._tx(self.RELAY))
+    self.assertTrue(self._tx(self.CAM_QUIET))
+    self._cam(self.CAM_QUIET)
+    self.assertFalse(self._tx(self.RELAY))
+
+  def test_undeclared_car_neither_blocks_nor_relays(self):
+    self._init(non_mrcc=False)
+    self._cam(self.CAM_CHIME)
+    self._steering(True)
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x21c))
+    self.assertFalse(self._tx(self.RELAY))

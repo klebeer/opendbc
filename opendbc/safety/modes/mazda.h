@@ -18,6 +18,12 @@
 #define MAZDA_MODE_Y_BIT 13U
 // sunnypilot safety param: no MRCC module, so CRZ_CTRL stops a few seconds after ignition.
 #define MAZDA_PARAM_SP_NON_MRCC 2U
+// The camera's CRZ_CTRL sets DBC bit 39 (byte 4, bit 7; unnamed) while another controller
+// applies steering torque, and the cluster chimes for as long as it stays set.
+#define MAZDA_CRZ_CTRL_STEER_CHIME_BYTE 4U
+#define MAZDA_CRZ_CTRL_STEER_CHIME_MASK 0x80U
+// Camera frames the relay may copy: openpilot runs a frame or two behind the camera.
+#define MAZDA_CAM_CRZ_CTRL_HISTORY 2U
 #define MAZDA_RADAR_STATIC  0x499U
 #define MAZDA_RADAR_TRACK_1 0x361U
 #define MAZDA_RADAR_TRACK_2 0x362U
@@ -56,6 +62,8 @@ static bool mazda_steer_to_zero_eps = false;
 static bool mazda_legacy_fw_eps = false;
 static uint32_t mazda_engage_btn_frames = 0U;
 static uint32_t mazda_cancel_context_frames = 0U;
+static uint8_t mazda_cam_crz_ctrl[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
+static uint32_t mazda_cam_crz_ctrl_seen = 0U;
 
 // Pin replaced-radar traffic to captured stock patterns where possible.
 
@@ -214,6 +222,37 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       brake_pressed = brake;
     }
   }
+
+  if (((int)msg->bus == MAZDA_CAM) && (msg->addr == MAZDA_CRZ_CTRL) && mazda_non_mrcc) {
+    for (uint32_t i = 0U; i < 8U; i++) {
+      mazda_cam_crz_ctrl[1][i] = mazda_cam_crz_ctrl[0][i];
+      mazda_cam_crz_ctrl[0][i] = msg->data[i];
+    }
+    if (mazda_cam_crz_ctrl_seen < MAZDA_CAM_CRZ_CTRL_HISTORY) {
+      mazda_cam_crz_ctrl_seen += 1U;
+    }
+  }
+}
+
+// openpilot's CRZ_CTRL on a car without MRCC: a recent camera frame, byte for byte, with only
+// the steering chime bit cleared. Nothing else in the frame, cruise state included, can change.
+static bool mazda_crz_ctrl_relay_valid(const CANPacket_t *msg) {
+  bool valid = false;
+
+  if ((msg->data[MAZDA_CRZ_CTRL_STEER_CHIME_BYTE] & MAZDA_CRZ_CTRL_STEER_CHIME_MASK) == 0U) {
+    for (uint32_t f = 0U; f < mazda_cam_crz_ctrl_seen; f++) {
+      bool same = true;
+      for (uint32_t i = 0U; i < 8U; i++) {
+        uint8_t mask = (i == MAZDA_CRZ_CTRL_STEER_CHIME_BYTE) ? (uint8_t)(~MAZDA_CRZ_CTRL_STEER_CHIME_MASK) : 0xffU;
+        if ((msg->data[i] & mask) != (mazda_cam_crz_ctrl[f][i] & mask)) {
+          same = false;
+        }
+      }
+      valid = valid || same;
+    }
+  }
+
+  return valid;
 }
 
 static bool mazda_is_lka_addr(int addr) {
@@ -295,6 +334,13 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   // Run after steering checks, which reset rate-limit state while disengaged.
   if (main_bus && mazda_is_lka_addr(msg->addr) && !mazda_openpilot_controlling()) {
     tx = false;
+  }
+
+  if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_CRZ_CTRL)) {
+    // Stands in for the camera's frame only while that frame is blocked below.
+    if (!mazda_openpilot_controlling() || !mazda_crz_ctrl_relay_valid(msg)) {
+      tx = false;
+    }
   }
 
   if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
@@ -380,6 +426,9 @@ static bool mazda_fwd_hook(int bus_num, int addr) {
     if (mazda_is_lka_addr(addr)) {
       block_msg = mazda_openpilot_controlling();
     }
+    if (mazda_non_mrcc && ((unsigned int)addr == MAZDA_CRZ_CTRL)) {
+      block_msg = mazda_openpilot_controlling();
+    }
   }
 
   return block_msg;
@@ -388,6 +437,7 @@ static bool mazda_fwd_hook(int bus_num, int addr) {
 static safety_config mazda_init(uint16_t param) {
   mazda_engage_btn_frames = 0U;
   mazda_cancel_context_frames = 0U;
+  mazda_cam_crz_ctrl_seen = 0U;
 
   static const CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
@@ -395,6 +445,15 @@ static safety_config mazda_init(uint16_t param) {
     {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
     // The camera press: no relay check, so the wheel's own 0x09d keeps forwarding to the camera.
     {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
+  };
+
+  // No relay check on CRZ_CTRL: the body publishes it on the main bus for the first seconds.
+  static const CanMsg MAZDA_NON_MRCC_TX_MSGS[] = {
+    {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
+    {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
+    {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
+    {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
   };
 
 // Replaced-radar addresses omit relay checks because the radar remains live during boot and
@@ -441,6 +500,15 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
+  // The camera's CRZ_CTRL is checked so the rx hook can keep the frames the relay copies.
+  static RxCheck mazda_non_mrcc_rx_checks[] = {
+    {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_CRZ_CTRL, MAZDA_CAM, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+  };
+
   mazda_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
   mazda_steer_to_zero_eps = GET_FLAG(param, MAZDA_PARAM_STEER_TO_ZERO_EPS);
   mazda_legacy_fw_eps = GET_FLAG(param, MAZDA_PARAM_LEGACY_FW_EPS);
@@ -448,10 +516,10 @@ static safety_config mazda_init(uint16_t param) {
   mazda_non_mrcc = GET_FLAG(current_safety_param_sp, MAZDA_PARAM_SP_NON_MRCC);
   acc_main_on = false;
 
-  // A car with no MRCC never publishes CRZ_CTRL past the first seconds, so it reuses the checks
-  // the radar teardown already needs, without opening the longitudinal TX list.
+  // A car with no MRCC never publishes CRZ_CTRL on the main bus past the first seconds, so it
+  // checks the camera's instead, without opening the longitudinal TX list.
   return mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_LONG_TX_MSGS) :
-         mazda_non_mrcc     ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_TX_MSGS) :
+         mazda_non_mrcc     ? BUILD_SAFETY_CFG(mazda_non_mrcc_rx_checks, MAZDA_NON_MRCC_TX_MSGS) :
                               BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
 }
 

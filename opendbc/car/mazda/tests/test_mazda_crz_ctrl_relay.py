@@ -81,6 +81,12 @@ class TestCapture:
     assert ci.CS.cam_crz_ctrl == CAM_CHIME
     assert ci.CS.cam_crz_ctrl_frames == 1
 
+  def test_plain_tuples_as_card_sends_them(self):
+    # openpilot's card converts capnp to (address, dat, src) tuples, not CanData
+    ci = car_interface(alpha_long=False, candidate=CAR.MAZDA_CX5_2022_NON_MRCC)
+    ci.update([(0, [(CRZ_CTRL, CAM_CHIME, 2)])])
+    assert ci.CS.cam_crz_ctrl == CAM_CHIME
+
   def test_car_side_frame_ignored(self):
     # the body's own CRZ_CTRL in the first seconds after ignition is not the camera's
     ci = car_interface(alpha_long=False, candidate=CAR.MAZDA_CX5_2022_NON_MRCC)

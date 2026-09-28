@@ -35,6 +35,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.steer_to_zero = bool(CP.flags & MazdaFlags.STEER_TO_ZERO_EPS)
     self.g46l = bool(CP.flags & MazdaFlags.G46L_RADAR)
     self.cam_crz_ctrl_frames_sent = 0
+    self.cam_traffic_signs_frames_sent = 0
     self.apply_torque_last = 0
     self.driver_torque_samples: deque[float] = deque(maxlen=self.params.STEER_DRIVER_SAMPLES if self.eps_2022 else 1)
     self.packer = CANPacker(dbc_names[Bus.pt])
@@ -145,6 +146,10 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     if CS.cam_crz_ctrl is not None and CS.cam_crz_ctrl_frames != self.cam_crz_ctrl_frames_sent:
       can_sends.append(mazdacan.create_crz_ctrl_relay(CS.cam_crz_ctrl))
       self.cam_crz_ctrl_frames_sent = CS.cam_crz_ctrl_frames
+    if CS.cam_traffic_signs is not None and CS.cam_traffic_signs_frames != self.cam_traffic_signs_frames_sent:
+      limit = next((int(p.value) for p in CC_SP.params if p.key == mazdacan.HUD_SPEED_LIMIT_PARAM), 0)
+      can_sends.append(mazdacan.create_traffic_signs_relay(CS.cam_traffic_signs, limit))
+      self.cam_traffic_signs_frames_sent = CS.cam_traffic_signs_frames
 
     # Suppress ICBM while cancel or resume is active to avoid competing button frames.
     icbm_suppress = CC.cruiseControl.cancel or CC.cruiseControl.resume or CS.cancel_button == 1

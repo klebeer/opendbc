@@ -6,9 +6,10 @@ steering torque; the cluster chimes for as long as it stays set. The controller 
 camera's frame back, byte for byte, with that bit cleared: one copy per camera frame. The panda
 forwards the camera's frame and drops the copy until openpilot is steering, then swaps them.
 """
+from opendbc.car import structs
 from opendbc.car.can_definitions import CanData
 from opendbc.car.mazda import mazdacan
-from opendbc.car.mazda.tests.conftest import car_controller, car_interface, frames, mazda_car_state, step
+from opendbc.car.mazda.tests.conftest import car_control, car_control_sp, car_controller, car_interface, frames, mazda_car_state, step
 from opendbc.car.mazda.values import CAR
 
 CRZ_CTRL = mazdacan.CRZ_CTRL_ADDR
@@ -97,3 +98,43 @@ class TestCapture:
     ci = car_interface(alpha_long=False, candidate=CAR.MAZDA_CX5_2022)
     ci.update(self._packets((CRZ_CTRL, CAM_CHIME, 2)))
     assert ci.CS.cam_crz_ctrl is None
+
+
+TRAFFIC_SIGNS = mazdacan.TRAFFIC_SIGNS_ADDR
+CAM_NO_SIGN = bytes.fromhex("00000000005c0000")
+
+
+def with_limit(kph):
+  cc_sp = car_control_sp()
+  cc_sp.params = [structs.CarControlSP.Param(key=mazdacan.HUD_SPEED_LIMIT_PARAM, value=str(kph).encode(),
+                                             type=structs.CarControlSP.ParamType.int)]
+  return cc_sp
+
+
+class TestTrafficSignsRelay:
+
+  def test_map_limit_matches_a_real_camera_50_kph_frame(self):
+    out = mazdacan.create_traffic_signs_relay(bytes.fromhex("0000000002000900"), 50)
+    assert out == CanData(TRAFFIC_SIGNS, bytes.fromhex("0ca0000002000900"), 0)
+
+  def test_camera_sign_wins(self):
+    cam = bytes.fromhex("1920000002010900")  # camera reads 100 km/h
+    assert mazdacan.create_traffic_signs_relay(cam, 50).dat == cam
+
+  def test_no_limit_or_implausible_copies_the_camera(self):
+    for kph in (0, 5, 125):
+      assert mazdacan.create_traffic_signs_relay(CAM_NO_SIGN, kph).dat == CAM_NO_SIGN
+
+  def test_controller_sends_one_per_camera_frame_with_the_map_limit(self):
+    cc, cs = rig()
+    cs.cam_traffic_signs = CAM_NO_SIGN
+    cs.cam_traffic_signs_frames = 1
+    _, sends = cc.update(car_control(lat_active=True), with_limit(50), cs, 0)
+    assert frames(sends, TRAFFIC_SIGNS) == [bytes.fromhex("0ca00000005c0000")]
+    _, sends = cc.update(car_control(lat_active=True), with_limit(50), cs, 0)
+    assert not frames(sends, TRAFFIC_SIGNS)
+
+  def test_capture_from_card_tuples(self):
+    ci = car_interface(alpha_long=False, candidate=CAR.MAZDA_CX5_2022_NON_MRCC)
+    ci.update([(0, [(TRAFFIC_SIGNS, CAM_NO_SIGN, 2)])])
+    assert ci.CS.cam_traffic_signs == CAM_NO_SIGN

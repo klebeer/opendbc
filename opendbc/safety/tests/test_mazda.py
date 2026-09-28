@@ -849,7 +849,9 @@ class TestMazdaNonMrcc(unittest.TestCase):
     return self.packer.make_can_msg_safety("CRZ_BTNS", 0, {"MODE_Y": pressed})
 
   def _feed_cam_crz_ctrl(self):
+    # the camera messages the relays copy are checked too
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRZ_CTRL", 2, {}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CAM_TRAFFIC_SIGNS", 2, {}))
 
   def test_declared_config_holds_without_crz_ctrl(self):
     # the whole point: the frame this car stops sending on the main bus is not part of the checks
@@ -1009,3 +1011,85 @@ class TestMazdaNonMrccCrzCtrlRelay(unittest.TestCase):
     self._steering(True)
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x21c))
     self.assertFalse(self._tx(self.RELAY))
+
+
+class TestMazdaNonMrccTrafficSignsRelay(unittest.TestCase):
+  """The camera's CAM_TRAFFIC_SIGNS, swapped for a copy that may carry the map's speed limit.
+
+  While openpilot steers, the panda blocks the camera's frame and accepts openpilot's copy of one
+  of the camera's last two frames. Only the speed sign fields may differ, and only to a km/h limit
+  of 10-120; everything else in the frame must match.
+  """
+
+  CAM_NONE = bytes.fromhex("00000000005c0000")
+  MAP_50 = bytes.fromhex("0ca00000005c0000")
+  CAM_50 = bytes.fromhex("0ca0000002000900")
+
+  def setUp(self):
+    self.safety = libsafety_py.libsafety
+    self._init(non_mrcc=True)
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)
+    self.safety.set_mads_params(False, False, False)
+
+  def _init(self, non_mrcc):
+    self.safety.set_current_safety_param_sp(MazdaSafetyFlagsSP.NON_MRCC if non_mrcc else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, 0)
+    self.safety.init_tests()
+    self.safety.set_mads_params(True, False, False)
+
+  def _cam(self, dat):
+    self.safety.safety_rx_hook(make_msg(2, 0x35f, 8, dat))
+
+  def _tx(self, dat):
+    return self.safety.safety_tx_hook(make_msg(0, 0x35f, 8, dat))
+
+  def test_camera_frame_blocked_only_while_openpilot_steers(self):
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x35f))
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertEqual(-1, self.safety.safety_fwd_hook(2, 0x35f))
+
+  def test_map_limit_accepted_while_steering(self):
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._tx(self.MAP_50))
+    self.assertTrue(self._tx(self.CAM_NONE), "an unchanged copy is fine too")
+
+  def test_rejected_while_not_steering_or_before_a_camera_frame(self):
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertFalse(self._tx(self.MAP_50))
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(False)
+    self.assertFalse(self._tx(self.MAP_50))
+
+  def test_limit_must_be_kph_within_the_posted_range(self):
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(True)
+    for kph, unit in ((5, 2), (125, 2), (50, 1), (50, 3)):
+      dat = bytearray(self.CAM_NONE)
+      dat[0] = (dat[0] & 0xe0) | ((kph >> 2) & 0x1f)
+      dat[1] = (dat[1] & 0x0f) | ((kph & 0x3) << 6) | (unit << 4)
+      self.assertFalse(self._tx(bytes(dat)), f"{kph} unit {unit}")
+
+  def test_nothing_else_in_the_frame_can_change(self):
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(True)
+    for byte, mask in ((0, 0xe0), (1, 0x0f), (2, 0xff), (4, 0xff), (5, 0xff), (7, 0xff)):
+      bit = mask & -mask
+      dat = bytearray(self.MAP_50)
+      dat[byte] ^= bit
+      self.assertFalse(self._tx(bytes(dat)), f"byte {byte} bit {bit:#x}")
+
+  def test_camera_sign_copied_unchanged(self):
+    self._cam(self.CAM_50)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertTrue(self._tx(self.CAM_50))
+
+  def test_undeclared_car_neither_blocks_nor_relays(self):
+    self._init(non_mrcc=False)
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(True)
+    self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x35f))
+    self.assertFalse(self._tx(self.MAP_50))

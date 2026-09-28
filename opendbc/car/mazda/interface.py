@@ -105,4 +105,7 @@ class CarInterface(CarInterfaceBase):
           if src == 2 and address == mazdacan.CRZ_CTRL_ADDR:
             self.CS.cam_crz_ctrl = bytes(dat)
             self.CS.cam_crz_ctrl_frames += 1
+          elif src == 2 and address == mazdacan.TRAFFIC_SIGNS_ADDR:
+            self.CS.cam_traffic_signs = bytes(dat)
+            self.CS.cam_traffic_signs_frames += 1
     return super().update(can_packets)

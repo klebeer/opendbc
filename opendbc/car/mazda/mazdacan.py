@@ -28,6 +28,13 @@ CRZ_CTRL_ADDR = 0x21c
 CRZ_CTRL_STEER_CHIME_BYTE = 4
 CRZ_CTRL_STEER_CHIME_MASK = 0x80
 
+# CAM_TRAFFIC_SIGNS draws the speed limit sign on the HUD. SPEED_SIGN is bits 4..0 of byte 0 and
+# 7..6 of byte 1, SPEED_SIGN_UNIT bits 5..4 of byte 1 (0 = no sign, 2 = km/h).
+TRAFFIC_SIGNS_ADDR = 0x35f
+HUD_SPEED_LIMIT_PARAM = "HudSpeedLimitKph"
+TSR_MIN_KPH, TSR_MAX_KPH = 10, 120
+TSR_UNIT_KPH = 2
+
 
 def crz_info_checksum(dat: bytes) -> int:
   # Invert the sum of the first seven bytes, excluding STOPPING and RESUME_UNLATCHING.
@@ -198,6 +205,16 @@ def create_crz_ctrl_relay(cam_frame: bytes) -> CanData:
   dat = bytearray(cam_frame)
   dat[CRZ_CTRL_STEER_CHIME_BYTE] &= ~CRZ_CTRL_STEER_CHIME_MASK & 0xff
   return CanData(CRZ_CTRL_ADDR, bytes(dat), 0)
+
+
+def create_traffic_signs_relay(cam_frame: bytes, limit_kph: int) -> CanData:
+  # The camera's sign wins; the map's limit fills the HUD only when the camera shows none.
+  dat = bytearray(cam_frame)
+  camera_unit = (dat[1] >> 4) & 0x3
+  if camera_unit == 0 and TSR_MIN_KPH <= limit_kph <= TSR_MAX_KPH:
+    dat[0] = (dat[0] & 0xe0) | ((limit_kph >> 2) & 0x1f)
+    dat[1] = (dat[1] & 0x0f) | ((limit_kph & 0x3) << 6) | (TSR_UNIT_KPH << 4)
+  return CanData(TRAFFIC_SIGNS_ADDR, bytes(dat), 0)
 
 
 def create_button_cmd(packer, CP, counter, button, bus=0):

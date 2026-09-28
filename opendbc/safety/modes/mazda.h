@@ -24,6 +24,14 @@
 #define MAZDA_CRZ_CTRL_STEER_CHIME_MASK 0x80U
 // Camera frames the relay may copy: openpilot runs a frame or two behind the camera.
 #define MAZDA_CAM_CRZ_CTRL_HISTORY 2U
+// CAM_TRAFFIC_SIGNS draws the speed limit sign on the HUD. SPEED_SIGN is DBC bits 4..0 of byte 0
+// and 7..6 of byte 1, SPEED_SIGN_UNIT bits 5..4 of byte 1 (2 = km/h).
+#define MAZDA_TRAFFIC_SIGNS 0x35fU
+#define MAZDA_TSR_BYTE0_SIGN_MASK 0x1FU
+#define MAZDA_TSR_BYTE1_SIGN_MASK 0xF0U
+#define MAZDA_TSR_UNIT_KPH 2U
+#define MAZDA_TSR_MIN_KPH 10U
+#define MAZDA_TSR_MAX_KPH 120U
 #define MAZDA_RADAR_STATIC  0x499U
 #define MAZDA_RADAR_TRACK_1 0x361U
 #define MAZDA_RADAR_TRACK_2 0x362U
@@ -64,6 +72,8 @@ static uint32_t mazda_engage_btn_frames = 0U;
 static uint32_t mazda_cancel_context_frames = 0U;
 static uint8_t mazda_cam_crz_ctrl[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
 static uint32_t mazda_cam_crz_ctrl_seen = 0U;
+static uint8_t mazda_cam_tsr[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
+static uint32_t mazda_cam_tsr_seen = 0U;
 
 // Pin replaced-radar traffic to captured stock patterns where possible.
 
@@ -232,6 +242,40 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       mazda_cam_crz_ctrl_seen += 1U;
     }
   }
+
+  if (((int)msg->bus == MAZDA_CAM) && (msg->addr == MAZDA_TRAFFIC_SIGNS) && mazda_non_mrcc) {
+    for (uint32_t i = 0U; i < 8U; i++) {
+      mazda_cam_tsr[1][i] = mazda_cam_tsr[0][i];
+      mazda_cam_tsr[0][i] = msg->data[i];
+    }
+    if (mazda_cam_tsr_seen < MAZDA_CAM_CRZ_CTRL_HISTORY) {
+      mazda_cam_tsr_seen += 1U;
+    }
+  }
+}
+
+// openpilot's CAM_TRAFFIC_SIGNS on a car without MRCC: a recent camera frame, byte for byte,
+// except the speed sign fields, which may only change to a km/h limit within the posted range.
+static bool mazda_tsr_relay_valid(const CANPacket_t *msg) {
+  bool valid = false;
+  uint32_t speed = (((uint32_t)msg->data[0] & MAZDA_TSR_BYTE0_SIGN_MASK) << 2U) | ((uint32_t)msg->data[1] >> 6U);
+  uint32_t unit = ((uint32_t)msg->data[1] >> 4U) & 0x3U;
+  bool plausible = (unit == MAZDA_TSR_UNIT_KPH) && (speed >= MAZDA_TSR_MIN_KPH) && (speed <= MAZDA_TSR_MAX_KPH);
+
+  for (uint32_t f = 0U; f < mazda_cam_tsr_seen; f++) {
+    bool rest_same = ((msg->data[0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK)) == (mazda_cam_tsr[f][0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK))) &&
+                     ((msg->data[1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)) == (mazda_cam_tsr[f][1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)));
+    for (uint32_t i = 2U; i < 8U; i++) {
+      if (msg->data[i] != mazda_cam_tsr[f][i]) {
+        rest_same = false;
+      }
+    }
+    bool sign_same = ((msg->data[0] & MAZDA_TSR_BYTE0_SIGN_MASK) == (mazda_cam_tsr[f][0] & MAZDA_TSR_BYTE0_SIGN_MASK)) &&
+                     ((msg->data[1] & MAZDA_TSR_BYTE1_SIGN_MASK) == (mazda_cam_tsr[f][1] & MAZDA_TSR_BYTE1_SIGN_MASK));
+    valid = valid || (rest_same && (sign_same || plausible));
+  }
+
+  return valid;
 }
 
 // openpilot's CRZ_CTRL on a car without MRCC: a recent camera frame, byte for byte, with only
@@ -336,6 +380,13 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     tx = false;
   }
 
+  if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_TRAFFIC_SIGNS)) {
+    // Stands in for the camera's frame only while that frame is blocked below.
+    if (!mazda_openpilot_controlling() || !mazda_tsr_relay_valid(msg)) {
+      tx = false;
+    }
+  }
+
   if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_CRZ_CTRL)) {
     // Stands in for the camera's frame only while that frame is blocked below.
     if (!mazda_openpilot_controlling() || !mazda_crz_ctrl_relay_valid(msg)) {
@@ -426,7 +477,7 @@ static bool mazda_fwd_hook(int bus_num, int addr) {
     if (mazda_is_lka_addr(addr)) {
       block_msg = mazda_openpilot_controlling();
     }
-    if (mazda_non_mrcc && ((unsigned int)addr == MAZDA_CRZ_CTRL)) {
+    if (mazda_non_mrcc && (((unsigned int)addr == MAZDA_CRZ_CTRL) || ((unsigned int)addr == MAZDA_TRAFFIC_SIGNS))) {
       block_msg = mazda_openpilot_controlling();
     }
   }
@@ -438,6 +489,7 @@ static safety_config mazda_init(uint16_t param) {
   mazda_engage_btn_frames = 0U;
   mazda_cancel_context_frames = 0U;
   mazda_cam_crz_ctrl_seen = 0U;
+  mazda_cam_tsr_seen = 0U;
 
   static const CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
@@ -454,6 +506,7 @@ static safety_config mazda_init(uint16_t param) {
     {MAZDA_LKAS_HUD, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
     {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
+    {MAZDA_TRAFFIC_SIGNS, 0, 8, .check_relay = false},
   };
 
 // Replaced-radar addresses omit relay checks because the radar remains live during boot and
@@ -507,6 +560,7 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_CRZ_CTRL, MAZDA_CAM, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_TRAFFIC_SIGNS, MAZDA_CAM, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
   mazda_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);

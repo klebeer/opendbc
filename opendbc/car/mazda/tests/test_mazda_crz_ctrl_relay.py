@@ -113,9 +113,10 @@ def with_limit(kph):
 
 class TestTrafficSignsRelay:
 
-  def test_map_limit_matches_a_real_camera_50_kph_frame(self):
+  def test_map_limit_sets_the_sign_and_both_shown_bits(self):
+    # the cluster and the HUD draw it only with byte 4 bits 1-0 set (parked probe on the car)
     out = mazdacan.create_traffic_signs_relay(bytes.fromhex("0000000002000900"), 50)
-    assert out == CanData(TRAFFIC_SIGNS, bytes.fromhex("0ca0000002000900"), 0)
+    assert out == CanData(TRAFFIC_SIGNS, bytes.fromhex("0ca0000003000900"), 0)
 
   def test_camera_sign_wins(self):
     cam = bytes.fromhex("1920000002010900")  # camera reads 100 km/h
@@ -130,9 +131,20 @@ class TestTrafficSignsRelay:
     cs.cam_traffic_signs = CAM_NO_SIGN
     cs.cam_traffic_signs_frames = 1
     _, sends = cc.update(car_control(lat_active=True), with_limit(50), cs, 0)
-    assert frames(sends, TRAFFIC_SIGNS) == [bytes.fromhex("0ca00000005c0000")]
+    assert frames(sends, TRAFFIC_SIGNS) == [bytes.fromhex("0ca00000035c0000")]
     _, sends = cc.update(car_control(lat_active=True), with_limit(50), cs, 0)
     assert not frames(sends, TRAFFIC_SIGNS)
+
+  def test_nothing_sent_with_lateral_off(self):
+    # the cluster keeps the camera's frame, so CarPlay navigation keeps the HUD slot
+    cc, cs = rig()
+    cs.cam_traffic_signs = CAM_NO_SIGN
+    cs.cam_traffic_signs_frames = 1
+    _, sends = cc.update(car_control(lat_active=False), with_limit(50), cs, 0)
+    assert not frames(sends, TRAFFIC_SIGNS)
+    # and the frame is not counted as sent, so it goes out on the first steering frame
+    _, sends = cc.update(car_control(lat_active=True), with_limit(50), cs, 0)
+    assert frames(sends, TRAFFIC_SIGNS) == [bytes.fromhex("0ca00000035c0000")]
 
   def test_capture_from_card_tuples(self):
     ci = car_interface(alpha_long=False, candidate=CAR.MAZDA_CX5_2022_NON_MRCC)

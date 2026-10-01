@@ -849,9 +849,11 @@ class TestMazdaNonMrcc(unittest.TestCase):
     return self.packer.make_can_msg_safety("CRZ_BTNS", 0, {"MODE_Y": pressed})
 
   def _feed_cam_crz_ctrl(self):
-    # the camera messages the relays copy are checked too
+    # the camera messages the relays copy, and the car's Auto Hold frames, are checked too
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CRZ_CTRL", 2, {}))
     self.safety.safety_rx_hook(self.packer.make_can_msg_safety("CAM_TRAFFIC_SIGNS", 2, {}))
+    self.safety.safety_rx_hook(make_msg(0, 0x203, 8))
+    self.safety.safety_rx_hook(make_msg(0, 0x079, 8))
 
   def test_declared_config_holds_without_crz_ctrl(self):
     # the whole point: the frame this car stops sending on the main bus is not part of the checks
@@ -1017,12 +1019,12 @@ class TestMazdaNonMrccTrafficSignsRelay(unittest.TestCase):
   """The camera's CAM_TRAFFIC_SIGNS, swapped for a copy that may carry the map's speed limit.
 
   While openpilot steers, the panda blocks the camera's frame and accepts openpilot's copy of one
-  of the camera's last two frames. Only the speed sign fields may differ, and only to a km/h limit
-  of 10-120; everything else in the frame must match.
+  of the camera's last two frames. Only the speed sign fields may differ, only to a km/h limit of
+  10-120, and then with both sign-shown bits of byte 4 set; everything else in the frame must match.
   """
 
   CAM_NONE = bytes.fromhex("00000000005c0000")
-  MAP_50 = bytes.fromhex("0ca00000005c0000")
+  MAP_50 = bytes.fromhex("0ca00000035c0000")
   CAM_50 = bytes.fromhex("0ca0000002000900")
 
   def setUp(self):
@@ -1082,6 +1084,22 @@ class TestMazdaNonMrccTrafficSignsRelay(unittest.TestCase):
       dat[byte] ^= bit
       self.assertFalse(self._tx(bytes(dat)), f"byte {byte} bit {bit:#x}")
 
+  def test_map_limit_needs_both_shown_bits(self):
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(True)
+    for byte4 in (0x00, 0x01, 0x02):
+      dat = bytearray(self.MAP_50)
+      dat[4] = byte4
+      self.assertFalse(self._tx(bytes(dat)), f"byte 4 = {byte4:#x}")
+
+  def test_shown_bits_alone_cannot_be_set(self):
+    # without a plausible limit in the frame the bits stay as the camera sent them
+    self._cam(self.CAM_NONE)
+    self.safety.set_controls_allowed_lateral(True)
+    dat = bytearray(self.CAM_NONE)
+    dat[4] |= 0x03
+    self.assertFalse(self._tx(bytes(dat)))
+
   def test_camera_sign_copied_unchanged(self):
     self._cam(self.CAM_50)
     self.safety.set_controls_allowed_lateral(True)
@@ -1093,3 +1111,116 @@ class TestMazdaNonMrccTrafficSignsRelay(unittest.TestCase):
     self.safety.set_controls_allowed_lateral(True)
     self.assertEqual(0, self.safety.safety_fwd_hook(2, 0x35f))
     self.assertFalse(self._tx(self.MAP_50))
+
+
+class TestMazdaNonMrccAutoHoldPress(unittest.TestCase):
+  """openpilot's Auto Hold press on a car without MRCC.
+
+  The panda accepts it only as one of the car's last two released 0x203 frames with the button
+  set, the next counter and the checksum that follows, and only stopped, with the brake held and
+  0x079 reading Auto Hold off: a press on an armed Auto Hold would switch it off.
+  """
+
+  # pressed frame captured on the car, and the released frame one counter earlier
+  CAR_RELEASED = bytes.fromhex("4000a65610010800")
+  PRESS = bytes.fromhex("4000a65720ff0800")
+
+  def setUp(self):
+    self.packer = CANPackerSafety("mazda_2017")
+    self.safety = libsafety_py.libsafety
+    self._init(non_mrcc=True)
+
+  def tearDown(self):
+    self.safety.set_current_safety_param_sp(0)
+    self.safety.set_mads_params(False, False, False)
+
+  def _init(self, non_mrcc):
+    self.safety.set_current_safety_param_sp(MazdaSafetyFlagsSP.NON_MRCC if non_mrcc else 0)
+    self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, 0)
+    self.safety.init_tests()
+    self.safety.set_mads_params(True, False, False)
+
+  def _car(self, dat):
+    self.safety.safety_rx_hook(make_msg(0, 0x203, 8, dat))
+
+  def _armed(self, armed):
+    self.safety.safety_rx_hook(make_msg(0, 0x079, 8, bytes([0, 0, 0, 0x40 if armed else 0, 0, 0, 0, 0])))
+
+  def _stopped(self, stopped=True, brake=True):
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("ENGINE_DATA", 0, {"SPEED": 0 if stopped else 20}))
+    self.safety.safety_rx_hook(self.packer.make_can_msg_safety("PEDALS", 0, {"BRAKE_ON": brake}))
+
+  def _ready(self):
+    self._car(self.CAR_RELEASED)
+    self._armed(False)
+    self._stopped()
+
+  def _tx(self, dat):
+    return self.safety.safety_tx_hook(make_msg(0, 0x203, 8, dat))
+
+  def test_accepted_stopped_braking_and_unarmed(self):
+    self._ready()
+    self.assertTrue(self._tx(self.PRESS))
+
+  def test_rejected_while_moving_or_off_the_brake(self):
+    self._ready()
+    self._stopped(stopped=False)
+    self.assertFalse(self._tx(self.PRESS))
+    self._stopped(brake=False)
+    self.assertFalse(self._tx(self.PRESS))
+
+  def test_rejected_while_armed_or_before_the_armed_state_is_known(self):
+    self._car(self.CAR_RELEASED)
+    self._stopped()
+    self.assertFalse(self._tx(self.PRESS), "unknown counts as armed")
+    self._armed(True)
+    self.assertFalse(self._tx(self.PRESS))
+
+  def test_rejected_before_any_car_frame(self):
+    self._armed(False)
+    self._stopped()
+    self.assertFalse(self._tx(self.PRESS))
+
+  def test_counter_and_checksum_must_follow(self):
+    self._ready()
+    self.assertFalse(self._tx(bytes.fromhex("4000a65710ff0800")), "same counter as the car's frame")
+    self.assertFalse(self._tx(bytes.fromhex("4000a65720fe0800")), "wrong checksum")
+
+  def test_counter_wrap(self):
+    self._car(bytes.fromhex("4000a656f0f30800"))
+    self._armed(False)
+    self._stopped()
+    self.assertTrue(self._tx(bytes.fromhex("4000a65700010800")))
+
+  def test_any_other_bit_change_is_rejected(self):
+    self._ready()
+    for byte in (0, 1, 2, 3, 4, 6, 7):
+      for bit in range(8):
+        if (byte == 3 and bit == 0) or (byte == 4 and bit >= 4):
+          continue
+        dat = bytearray(self.PRESS)
+        dat[byte] ^= 1 << bit
+        self.assertFalse(self._tx(bytes(dat)), f"byte {byte} bit {bit} changed")
+
+  def test_a_released_copy_is_not_a_press(self):
+    self._ready()
+    self.assertFalse(self._tx(self.CAR_RELEASED))
+
+  def test_not_on_top_of_the_drivers_own_press(self):
+    self._car(self.PRESS)
+    self._armed(False)
+    self._stopped()
+    # what the rule would build from a pressed frame, counter and checksum stepped as usual
+    self.assertFalse(self._tx(bytes.fromhex("4000a65730fd0800")))
+
+  def test_previous_car_frame_still_accepted(self):
+    self._ready()
+    self._car(bytes.fromhex("4000a65620000800"))
+    self.assertTrue(self._tx(self.PRESS))
+    self._car(bytes.fromhex("4000a65630ff0800"))
+    self.assertFalse(self._tx(self.PRESS))
+
+  def test_undeclared_car_never_presses(self):
+    self._init(non_mrcc=False)
+    self._ready()
+    self.assertFalse(self._tx(self.PRESS))

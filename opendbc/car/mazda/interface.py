@@ -97,7 +97,7 @@ class CarInterface(CarInterfaceBase):
     return ret
 
   def update(self, can_packets: list[tuple[int, list[CanData]]]):
-    # The parser keeps signals only, and the CRZ_CTRL relay needs the camera's frame raw.
+    # The parser keeps signals only; the relays and the Auto Hold press need frames raw.
     if self.CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC:
       # card hands plain (address, dat, src) tuples, not CanData
       for _, frames in can_packets:
@@ -108,4 +108,9 @@ class CarInterface(CarInterfaceBase):
           elif src == 2 and address == mazdacan.TRAFFIC_SIGNS_ADDR:
             self.CS.cam_traffic_signs = bytes(dat)
             self.CS.cam_traffic_signs_frames += 1
+          elif src == 0 and address == mazdacan.AUTO_HOLD_BTN_ADDR:
+            self.CS.auto_hold_btn = bytes(dat)
+            self.CS.auto_hold_btn_frames += 1
+          elif src == 0 and address == mazdacan.EPB_ADDR:
+            self.CS.auto_hold_armed = bool(dat[mazdacan.EPB_AUTO_HOLD_ARMED_BYTE] & mazdacan.EPB_AUTO_HOLD_ARMED_MASK)
     return super().update(can_packets)

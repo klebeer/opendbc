@@ -123,9 +123,12 @@ def car_control(enabled=None, long_active=True, lat_active=False, accel=0.5, tor
   return cc.as_reader()
 
 
-def car_control_sp(handback=False, lead_d_rel=12.0, lead_v_rel=0.0, send_button=SendButtonState.none) -> structs.CarControlSP:
+def car_control_sp(handback=False, lead_d_rel=12.0, lead_v_rel=0.0, send_button=SendButtonState.none,
+                   auto_hold=False) -> structs.CarControlSP:
   cc_sp = structs.CarControlSP()
   cc_sp.stockEcuHandBack = handback
+  if auto_hold:
+    cc_sp.params = [structs.CarControlSP.Param(key="MazdaAutoHold", value=b"1", type=structs.CarControlSP.ParamType.bool)]
   cc_sp.leadOne.dRel = lead_d_rel
   cc_sp.leadOne.vRel = lead_v_rel
   cc_sp.intelligentCruiseButtonManagement.sendButton = send_button

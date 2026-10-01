@@ -54,6 +54,11 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.tja_press_count = 0
     self.tja_press_frame: int | None = None
     self.tja_episode_alerted = False
+    self.auto_hold_btn_frames_sent = 0
+    self.auto_hold_done = False
+    self.auto_hold_attempts = 0
+    self.auto_hold_press_frame: int | None = None
+    self.auto_hold_release_frame: int | None = None
 
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
@@ -146,10 +151,14 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     if CS.cam_crz_ctrl is not None and CS.cam_crz_ctrl_frames != self.cam_crz_ctrl_frames_sent:
       can_sends.append(mazdacan.create_crz_ctrl_relay(CS.cam_crz_ctrl))
       self.cam_crz_ctrl_frames_sent = CS.cam_crz_ctrl_frames
-    if CS.cam_traffic_signs is not None and CS.cam_traffic_signs_frames != self.cam_traffic_signs_frames_sent:
+    # Gated on lateral: the panda's own view of controlling trails this one by a frame or two, so
+    # ungated copies reach the cluster around a MADS transition and take the HUD slot that CarPlay
+    # navigation draws in (route 00000037, 17 frames with lateral off).
+    if CC.latActive and CS.cam_traffic_signs is not None and CS.cam_traffic_signs_frames != self.cam_traffic_signs_frames_sent:
       limit = next((int(p.value) for p in CC_SP.params if p.key == mazdacan.HUD_SPEED_LIMIT_PARAM), 0)
       can_sends.append(mazdacan.create_traffic_signs_relay(CS.cam_traffic_signs, limit))
       self.cam_traffic_signs_frames_sent = CS.cam_traffic_signs_frames
+    can_sends.extend(self.update_auto_hold(CC_SP, CS))
 
     # Suppress ICBM while cancel or resume is active to avoid competing button frames.
     icbm_suppress = CC.cruiseControl.cancel or CC.cruiseControl.resume or CS.cancel_button == 1
@@ -205,6 +214,43 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         CS.stock_cts_stuck = True
         self.tja_episode_alerted = True
     return can_sends
+
+  def update_auto_hold(self, CC_SP, CS):
+    """Press Auto Hold for the driver until it arms once in the drive.
+
+    Pressing it again while armed would switch it off, so the first time it reads armed, by our
+    press or the driver's, ends the job for the drive: a driver who switches it off later keeps
+    it off. The press only goes out stopped with the brake held, the state every recorded manual
+    arming happened in, and the panda enforces the same conditions. One copy per car frame, for
+    AUTO_HOLD_PRESS_T, at most AUTO_HOLD_PRESS_MAX times.
+    """
+    enabled = any(p.key == mazdacan.AUTO_HOLD_PARAM and p.value == b"1" for p in CC_SP.params)
+    if CS.auto_hold_armed:
+      self.auto_hold_done = True
+    new_frame = CS.auto_hold_btn is not None and CS.auto_hold_btn_frames != self.auto_hold_btn_frames_sent
+    if not new_frame:
+      return []
+    self.auto_hold_btn_frames_sent = CS.auto_hold_btn_frames
+    ready = CS.out.standstill and CS.out.brakePressed
+    if not enabled or self.auto_hold_done or CS.auto_hold_armed is None or not ready:
+      self.auto_hold_press_frame = None
+      return []
+
+    press_frames = int(CarControllerParams.AUTO_HOLD_PRESS_T / DT_CTRL)
+    retry_frames = int(CarControllerParams.AUTO_HOLD_RETRY_T / DT_CTRL)
+    if self.auto_hold_press_frame is not None and self.frame - self.auto_hold_press_frame >= press_frames:
+      self.auto_hold_press_frame = None
+      self.auto_hold_release_frame = self.frame
+    if self.auto_hold_press_frame is None:
+      rested = self.auto_hold_release_frame is None or self.frame - self.auto_hold_release_frame >= retry_frames
+      if not rested or self.auto_hold_attempts >= CarControllerParams.AUTO_HOLD_PRESS_MAX:
+        return []
+      self.auto_hold_press_frame = self.frame
+      self.auto_hold_attempts += 1
+    # The driver is holding the button: their frame already carries the press.
+    if CS.auto_hold_btn[mazdacan.AUTO_HOLD_BTN_BYTE] & mazdacan.AUTO_HOLD_BTN_MASK:
+      return []
+    return [mazdacan.create_auto_hold_press(CS.auto_hold_btn)]
 
   def resume_requested(self, CC) -> bool:
     """The resume button belongs to the stock-longitudinal path alone. Under openpilot longitudinal

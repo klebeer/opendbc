@@ -32,6 +32,18 @@
 #define MAZDA_TSR_UNIT_KPH 2U
 #define MAZDA_TSR_MIN_KPH 10U
 #define MAZDA_TSR_MAX_KPH 120U
+// NEW_SIGNAL_4 and SPEED_SIGN_CAM, byte 4 bits 1-0: the cluster and HUD draw the sign only with both set.
+#define MAZDA_TSR_SHOWN_BYTE 4U
+#define MAZDA_TSR_SHOWN_MASK 0x03U
+// Auto Hold button, byte 3 bit 0 of 0x203, sent by a car-side module at 50 Hz. CTR is the high
+// nibble of byte 4, and CHKSUM (byte 5) falls by one for each unit added to bytes 0-3 or to CTR.
+#define MAZDA_AUTO_HOLD_BTN 0x203U
+#define MAZDA_AUTO_HOLD_BTN_BYTE 3U
+#define MAZDA_AUTO_HOLD_BTN_MASK 0x01U
+// Auto Hold armed, byte 3 bit 6 of 0x079.
+#define MAZDA_EPB 0x079U
+#define MAZDA_EPB_AUTO_HOLD_ARMED_BYTE 3U
+#define MAZDA_EPB_AUTO_HOLD_ARMED_MASK 0x40U
 #define MAZDA_RADAR_STATIC  0x499U
 #define MAZDA_RADAR_TRACK_1 0x361U
 #define MAZDA_RADAR_TRACK_2 0x362U
@@ -74,6 +86,10 @@ static uint8_t mazda_cam_crz_ctrl[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
 static uint32_t mazda_cam_crz_ctrl_seen = 0U;
 static uint8_t mazda_cam_tsr[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
 static uint32_t mazda_cam_tsr_seen = 0U;
+static uint8_t mazda_auto_hold_btn[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
+static uint32_t mazda_auto_hold_btn_seen = 0U;
+// Unknown counts as armed: a press on an armed Auto Hold switches it off.
+static bool mazda_auto_hold_armed = true;
 
 // Pin replaced-radar traffic to captured stock patterns where possible.
 
@@ -252,10 +268,25 @@ static void mazda_rx_hook(const CANPacket_t *msg) {
       mazda_cam_tsr_seen += 1U;
     }
   }
+
+  if (((int)msg->bus == MAZDA_MAIN) && (msg->addr == MAZDA_AUTO_HOLD_BTN) && mazda_non_mrcc) {
+    for (uint32_t i = 0U; i < 8U; i++) {
+      mazda_auto_hold_btn[1][i] = mazda_auto_hold_btn[0][i];
+      mazda_auto_hold_btn[0][i] = msg->data[i];
+    }
+    if (mazda_auto_hold_btn_seen < MAZDA_CAM_CRZ_CTRL_HISTORY) {
+      mazda_auto_hold_btn_seen += 1U;
+    }
+  }
+
+  if (((int)msg->bus == MAZDA_MAIN) && (msg->addr == MAZDA_EPB) && mazda_non_mrcc) {
+    mazda_auto_hold_armed = (msg->data[MAZDA_EPB_AUTO_HOLD_ARMED_BYTE] & MAZDA_EPB_AUTO_HOLD_ARMED_MASK) != 0U;
+  }
 }
 
 // openpilot's CAM_TRAFFIC_SIGNS on a car without MRCC: a recent camera frame, byte for byte,
-// except the speed sign fields, which may only change to a km/h limit within the posted range.
+// except the speed sign fields, which may only change to a km/h limit within the posted range,
+// and then only with both sign-shown bits set.
 static bool mazda_tsr_relay_valid(const CANPacket_t *msg) {
   bool valid = false;
   uint32_t speed = (((uint32_t)msg->data[0] & MAZDA_TSR_BYTE0_SIGN_MASK) << 2U) | ((uint32_t)msg->data[1] >> 6U);
@@ -266,13 +297,16 @@ static bool mazda_tsr_relay_valid(const CANPacket_t *msg) {
     bool rest_same = ((msg->data[0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK)) == (mazda_cam_tsr[f][0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK))) &&
                      ((msg->data[1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)) == (mazda_cam_tsr[f][1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)));
     for (uint32_t i = 2U; i < 8U; i++) {
-      if (msg->data[i] != mazda_cam_tsr[f][i]) {
+      uint8_t mask = (i == MAZDA_TSR_SHOWN_BYTE) ? (uint8_t)(~MAZDA_TSR_SHOWN_MASK) : 0xffU;
+      if ((msg->data[i] & mask) != (mazda_cam_tsr[f][i] & mask)) {
         rest_same = false;
       }
     }
     bool sign_same = ((msg->data[0] & MAZDA_TSR_BYTE0_SIGN_MASK) == (mazda_cam_tsr[f][0] & MAZDA_TSR_BYTE0_SIGN_MASK)) &&
-                     ((msg->data[1] & MAZDA_TSR_BYTE1_SIGN_MASK) == (mazda_cam_tsr[f][1] & MAZDA_TSR_BYTE1_SIGN_MASK));
-    valid = valid || (rest_same && (sign_same || plausible));
+                     ((msg->data[1] & MAZDA_TSR_BYTE1_SIGN_MASK) == (mazda_cam_tsr[f][1] & MAZDA_TSR_BYTE1_SIGN_MASK)) &&
+                     ((msg->data[MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK) == (mazda_cam_tsr[f][MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK));
+    bool map_limit = plausible && ((msg->data[MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK) == MAZDA_TSR_SHOWN_MASK);
+    valid = valid || (rest_same && (sign_same || map_limit));
   }
 
   return valid;
@@ -294,6 +328,27 @@ static bool mazda_crz_ctrl_relay_valid(const CANPacket_t *msg) {
       }
       valid = valid || same;
     }
+  }
+
+  return valid;
+}
+
+// openpilot's Auto Hold press: one of the car's last two frames, released, with only the button
+// set, the next counter, and the checksum that follows from both. The counter wraps 15 -> 0.
+static bool mazda_auto_hold_press_valid(const CANPacket_t *msg) {
+  bool valid = false;
+
+  for (uint32_t f = 0U; f < mazda_auto_hold_btn_seen; f++) {
+    const uint8_t *car = mazda_auto_hold_btn[f];
+    uint8_t ctr = (uint8_t)((((uint32_t)car[4] >> 4U) + 1U) & 0xFU);
+    uint8_t chk = (ctr == 0U) ? (uint8_t)((uint32_t)car[5] + 14U) : (uint8_t)((uint32_t)car[5] - 2U);
+    bool released = (car[MAZDA_AUTO_HOLD_BTN_BYTE] & MAZDA_AUTO_HOLD_BTN_MASK) == 0U;
+    bool same = released &&
+                (msg->data[0] == car[0]) && (msg->data[1] == car[1]) && (msg->data[2] == car[2]) &&
+                (msg->data[3] == (uint8_t)(car[3] | MAZDA_AUTO_HOLD_BTN_MASK)) &&
+                (msg->data[4] == (uint8_t)((uint8_t)(ctr << 4U) | (car[4] & 0x0FU))) &&
+                (msg->data[5] == chk) && (msg->data[6] == car[6]) && (msg->data[7] == car[7]);
+    valid = valid || same;
   }
 
   return valid;
@@ -394,6 +449,13 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     }
   }
 
+  if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_AUTO_HOLD_BTN)) {
+    // Stopped with the brake held and Auto Hold off only: pressed while armed it switches off.
+    if (vehicle_moving || !brake_pressed || mazda_auto_hold_armed || !mazda_auto_hold_press_valid(msg)) {
+      tx = false;
+    }
+  }
+
   if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
     // Allow byte-exact stock standby patterns with the raw 8190 command sentinel.
     bool stock_standby = (msg->data[0] == 0x01U) && (msg->data[1] == 0xffU) &&
@@ -490,6 +552,8 @@ static safety_config mazda_init(uint16_t param) {
   mazda_cancel_context_frames = 0U;
   mazda_cam_crz_ctrl_seen = 0U;
   mazda_cam_tsr_seen = 0U;
+  mazda_auto_hold_btn_seen = 0U;
+  mazda_auto_hold_armed = true;
 
   static const CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
@@ -507,6 +571,8 @@ static safety_config mazda_init(uint16_t param) {
     {MAZDA_CRZ_BTNS, MAZDA_CAM, 8, .check_relay = false},
     {MAZDA_CRZ_CTRL, 0, 8, .check_relay = false},
     {MAZDA_TRAFFIC_SIGNS, 0, 8, .check_relay = false},
+    // No relay check: the car's own module keeps publishing the button on the main bus.
+    {MAZDA_AUTO_HOLD_BTN, 0, 8, .check_relay = false},
   };
 
 // Replaced-radar addresses omit relay checks because the radar remains live during boot and
@@ -553,7 +619,8 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
-  // The camera's CRZ_CTRL is checked so the rx hook can keep the frames the relay copies.
+  // The camera's CRZ_CTRL and the car's Auto Hold frames are checked so the rx hook sees the
+  // frames the relays copy and the armed state the press depends on.
   static RxCheck mazda_non_mrcc_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -561,6 +628,8 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_PEDALS,       0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_CRZ_CTRL, MAZDA_CAM, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_TRAFFIC_SIGNS, MAZDA_CAM, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_AUTO_HOLD_BTN, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
+    {.msg = {{MAZDA_EPB, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
   mazda_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);

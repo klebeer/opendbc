@@ -43,6 +43,11 @@ class CarControllerParams:
   # plus parser latency between presses, three per arming episode before the driver is told.
   TJA_PRESS_INTERVAL_T = 1.0
   TJA_PRESS_MAX = 3
+  # Auto Hold is pressed on the driver's behalf until it arms once per drive: the driver's own
+  # press lasts about 0.23 s, and three attempts two seconds apart before giving up.
+  AUTO_HOLD_PRESS_T = 0.25
+  AUTO_HOLD_RETRY_T = 2.0
+  AUTO_HOLD_PRESS_MAX = 3
   # The one-shot warning after the third press is a pulse; the alert's own duration shows it.
   STOCK_CTS_ALERT_T = 0.1
 

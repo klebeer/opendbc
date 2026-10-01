@@ -22,6 +22,34 @@ DIST_OBJ_MAX = 255.875    # m, the full-scale DIST_OBJ reading a track can carry
 # all, so the lead rides CRZ_CTRL alone; fully static — no counter, no checksum.
 G46L_RADAR_STATIC_MSG = (0x499, bytes.fromhex("0098400000000000"))
 
+# Auto Hold button, byte 3 bit 0 of 0x203, sent by a car-side module at 50 Hz. CTR is the high
+# nibble of byte 4, and CHKSUM (byte 5) falls by one for each unit added to bytes 0-3 or to CTR.
+AUTO_HOLD_BTN_ADDR = 0x203
+AUTO_HOLD_BTN_BYTE = 3
+AUTO_HOLD_BTN_MASK = 0x01
+AUTO_HOLD_PARAM = "MazdaAutoHold"
+# Auto Hold armed, byte 3 bit 6 of 0x079.
+EPB_ADDR = 0x079
+EPB_AUTO_HOLD_ARMED_BYTE = 3
+EPB_AUTO_HOLD_ARMED_MASK = 0x40
+
+CRZ_CTRL_ADDR = 0x21c
+# On a car without MRCC the camera publishes CRZ_CTRL, and sets DBC bit 39 (unnamed) while
+# another controller applies steering torque; the cluster chimes for as long as it is set.
+CRZ_CTRL_STEER_CHIME_BYTE = 4
+CRZ_CTRL_STEER_CHIME_MASK = 0x80
+
+# CAM_TRAFFIC_SIGNS draws the speed limit sign on the HUD. SPEED_SIGN is bits 4..0 of byte 0 and
+# 7..6 of byte 1, SPEED_SIGN_UNIT bits 5..4 of byte 1 (0 = no sign, 2 = km/h).
+TRAFFIC_SIGNS_ADDR = 0x35f
+HUD_SPEED_LIMIT_PARAM = "HudSpeedLimitKph"
+TSR_MIN_KPH, TSR_MAX_KPH = 10, 120
+TSR_UNIT_KPH = 2
+# NEW_SIGNAL_4 and SPEED_SIGN_CAM, byte 4 bits 1-0: the cluster and the HUD draw the sign only with
+# both set (parked probe on the car); with the speed fields alone they show nothing.
+TSR_SHOWN_BYTE = 4
+TSR_SHOWN_MASK = 0x03
+
 
 def crz_info_checksum(dat: bytes) -> int:
   # Invert the sum of the first seven bytes, excluding STOPPING and RESUME_UNLATCHING.
@@ -184,6 +212,37 @@ def create_alert_command(packer, cam_msg: dict, ldw: bool, steer_required: bool)
     "LDW_WARN_RL": 0,
   })
   return packer.make_can_msg("CAM_LANEINFO", 0, values)
+
+
+def create_crz_ctrl_relay(cam_frame: bytes) -> CanData:
+  # Copied raw: most of the frame has no DBC signal, and the panda accepts only a byte-exact
+  # copy of a recent camera frame.
+  dat = bytearray(cam_frame)
+  dat[CRZ_CTRL_STEER_CHIME_BYTE] &= ~CRZ_CTRL_STEER_CHIME_MASK & 0xff
+  return CanData(CRZ_CTRL_ADDR, bytes(dat), 0)
+
+
+def create_auto_hold_press(car_frame: bytes) -> CanData:
+  # The car's last frame with the button set and the next counter, so it lands ahead of the car's
+  # own frame with that counter. The panda accepts nothing else on this address. The same-counter
+  # variant never armed on the road (routes 00000036, 00000037); this one does.
+  dat = bytearray(car_frame)
+  ctr = ((dat[4] >> 4) + 1) & 0xf
+  dat[AUTO_HOLD_BTN_BYTE] |= AUTO_HOLD_BTN_MASK
+  dat[4] = (ctr << 4) | (dat[4] & 0x0f)
+  dat[5] = (dat[5] - 1 - (1 if ctr else -15)) & 0xff
+  return CanData(AUTO_HOLD_BTN_ADDR, bytes(dat), 0)
+
+
+def create_traffic_signs_relay(cam_frame: bytes, limit_kph: int) -> CanData:
+  # The camera's sign wins; the map's limit fills the HUD only when the camera shows none.
+  dat = bytearray(cam_frame)
+  camera_unit = (dat[1] >> 4) & 0x3
+  if camera_unit == 0 and TSR_MIN_KPH <= limit_kph <= TSR_MAX_KPH:
+    dat[0] = (dat[0] & 0xe0) | ((limit_kph >> 2) & 0x1f)
+    dat[1] = (dat[1] & 0x0f) | ((limit_kph & 0x3) << 6) | (TSR_UNIT_KPH << 4)
+    dat[TSR_SHOWN_BYTE] |= TSR_SHOWN_MASK
+  return CanData(TRAFFIC_SIGNS_ADDR, bytes(dat), 0)
 
 
 def create_button_cmd(packer, CP, counter, button, bus=0):

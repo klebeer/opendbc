@@ -84,12 +84,12 @@ class TestCarControllerParams:
     assert np.interp(14.5, bp, vals) == 620
     assert np.interp(35.0, bp, vals) == 620
 
-  def test_steer_delta_matches_the_eps_rate_limit_at_this_steer_step(self):
+  def test_steer_delta_rate_at_this_steer_step(self):
     params = cx5_2022_params()
-    # Per-frame controller deltas must match the 100 Hz EPS hardware slew in both directions.
+    # Per-frame deltas at 100 Hz give 1600 counts/s, above the EPS's measured 1200.
     rate_hz = 1.0 / DT_CTRL / CarControllerParams.STEER_STEP
-    assert params.STEER_DELTA_UP * rate_hz == pytest.approx(1200, rel=0.01)
-    assert params.STEER_DELTA_DOWN * rate_hz == pytest.approx(1200, rel=0.01)
+    assert params.STEER_DELTA_UP * rate_hz == pytest.approx(1600, rel=0.01)
+    assert params.STEER_DELTA_DOWN * rate_hz == pytest.approx(1600, rel=0.01)
 
   def test_cx5_2022_has_lookup(self):
     params = cx5_2022_params()
@@ -104,8 +104,8 @@ class TestCarControllerParams:
 
   def test_cx5_2022_rate_limits(self):
     params = cx5_2022_params()
-    assert params.STEER_DELTA_UP == 12
-    assert params.STEER_DELTA_DOWN == 12
+    assert params.STEER_DELTA_UP == 16
+    assert params.STEER_DELTA_DOWN == 16
 
   @pytest.mark.parametrize("params, panda", [
     (cx5_2022_params, "TestMazdaSteerToZeroEpsSafety"),

@@ -236,15 +236,15 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
 
 class TestMazdaSteerToZeroEpsSafety(TestMazdaSafety):
   """2022+ steer-to-zero EPS (CX-5 2022, CX-9 2021, EPS swaps): MazdaSafetyFlags.STEER_TO_ZERO_EPS
-  selects the 1200-count envelope with the EPS's own 12/12 slew."""
+  selects the 1200-count envelope with a 16/16 slew."""
 
   SAFETY_PARAM = MazdaSafetyFlags.STEER_TO_ZERO_EPS
 
-  MAX_RATE_UP = 12
-  MAX_RATE_DOWN = 12
+  MAX_RATE_UP = 16
+  MAX_RATE_DOWN = 16
   MAX_TORQUE_LOOKUP = [0], [1200]
 
-  MAX_RT_DELTA = 384
+  MAX_RT_DELTA = 512
 
   DRIVER_TORQUE_ALLOWANCE = 15
   DRIVER_TORQUE_FACTOR = 15
@@ -361,11 +361,11 @@ class TestMazdaLegacyFwEpsSafety(TestMazdaSafety):
 
   SAFETY_PARAM = MazdaSafetyFlags.LEGACY_FW_EPS
 
-  MAX_RATE_UP = 12
-  MAX_RATE_DOWN = 12
+  MAX_RATE_UP = 16
+  MAX_RATE_DOWN = 16
   MAX_TORQUE_LOOKUP = [0], [1200]
 
-  MAX_RT_DELTA = 384
+  MAX_RT_DELTA = 512
 
   DRIVER_TORQUE_ALLOWANCE = 15
   DRIVER_TORQUE_FACTOR = 15

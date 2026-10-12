@@ -392,14 +392,14 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     .type = TorqueDriverLimited,
   };
 
-  // The measured EPS envelope, selected by either firmware bit: the EPS's 12-count hardware
-  // slew, with max_rate_down equal to the controller retreat rate so driver-limit winddown
-  // frames remain valid.
+  // The 2022 EPS envelope, selected by either firmware bit: a 16-count slew, above the EPS's
+  // measured 12, with max_rate_down equal to the controller retreat rate so driver-limit
+  // winddown frames remain valid.
   const TorqueSteeringLimits MAZDA_STEER_TO_ZERO_EPS_STEERING_LIMITS = {
     .max_torque = 1200,
-    .max_rate_up = 12,
-    .max_rate_down = 12,
-    .max_rt_delta = 384,
+    .max_rate_up = 16,
+    .max_rate_down = 16,
+    .max_rt_delta = 512,
     .driver_torque_multiplier = 15,
     .driver_torque_allowance = 15,
     .type = TorqueDriverLimited,

@@ -102,9 +102,9 @@ class CarControllerParams:
   def __init__(self, CP):
     # Every gen1 Mazda EPS runs the measured envelope; the interface sets one of the two bits.
     if CP.flags & MazdaFlags.EPS_HW:
-      # Match the EPS hardware slew and panda safety limits in both directions.
-      self.STEER_DELTA_UP = 12
-      self.STEER_DELTA_DOWN = 12
+      # Above the EPS's measured 12-count slew; must equal the panda limits in both directions.
+      self.STEER_DELTA_UP = 16
+      self.STEER_DELTA_DOWN = 16
       self.STEER_DRIVER_MULTIPLIER = 15   # tuned for the CX-5 EPS response
       # Use a sample window and margin to stay inside panda's fresher driver-torque envelope.
       self.STEER_DRIVER_SAMPLES = 10

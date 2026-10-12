@@ -8,14 +8,25 @@ from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.carcontroller import CarController
 from opendbc.car.mazda.carstate import CarState
 from opendbc.car.mazda.radar_interface import RadarInterface
-from opendbc.car.mazda.values import CAR, DBC, G46L_RADAR_FW, LKAS_LIMITS, STEER_TO_ZERO_EPS_FW, STEER_TO_ZERO_PLATFORMS, SUPPORTED_PLATFORMS, MazdaFlags, \
-  MazdaSafetyFlags, platform_from_vin
+from opendbc.car.mazda.values import CAR, DBC, G46L_RADAR_FW, LKAS_LIMITS, STEER_TO_ZERO_EPS_FW, STEER_TO_ZERO_PLATFORMS, \
+  TORQUE_TUNES, CarControllerParams, MazdaFlags, MazdaSafetyFlags, WMI, platform_from_vin
+from opendbc.car.vin import Vin, is_valid_vin
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+  @staticmethod
+  def configure_torque_tune(candidate, tune, steering_angle_deadzone_deg=0.0):
+    # params.toml's tunes are on upstream's STEER_MAX. An override rather than a conversion in
+    # _get_params, so sunnypilot's second call (enforced torque, NNLC) converts as well.
+    CarInterfaceBase.configure_torque_tune(candidate, tune, steering_angle_deadzone_deg)
+    lat_accel_factor, friction = TORQUE_TUNES.get(candidate, (tune.torque.latAccelFactor, tune.torque.friction))
+    tune.torque.latAccelFactor = lat_accel_factor * CarControllerParams.TUNE_SCALE
+    tune.torque.friction = friction / CarControllerParams.TUNE_SCALE
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -62,11 +73,6 @@ class CarInterface(CarInterfaceBase):
       ret.stopAccel = -1.024  # stock MRCC standstill command
       ret.longitudinalActuatorDelay = 0.36  # measured ~0.3 s dead time + ~0.3 s first-order lag
 
-    # Older EPS firmware enforces hands-off and low-speed steering lockouts.
-    # Docs mode carries no real EPS firmware, so leave dashcamOnly at the default.
-    if not docs:
-      ret.dashcamOnly = candidate not in SUPPORTED_PLATFORMS and not steer_to_zero
-
     carlog.debug({"event": "mazdaRadarVerdict", "radarUnavailable": ret.radarUnavailable,
                   "platformClaim": Bus.radar in DBC[candidate], "g46lRadar": g46l_radar, "steerToZeroEps": steer_to_zero})
 
@@ -76,7 +82,7 @@ class CarInterface(CarInterfaceBase):
     ret.steerActuatorDelay = 0.14
     ret.steerLimitTimer = 0.8
 
-    CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
+    CarInterface.configure_torque_tune(candidate, ret.lateralTuning)
 
     ret.centerToFront = ret.wheelbase * 0.41
 
@@ -89,6 +95,10 @@ class CarInterface(CarInterfaceBase):
 
     # A carried-forward CarPlatformBundle can disagree with the physical car after a
     # hardware swap or a branch switch without reinstall.
+    # Oceania clusters over-read the held cruise speed (MazdaFlagsSP.OCEANIA_CLUSTER).
+    if is_valid_vin(stock_cp.carVin) and Vin(stock_cp.carVin).wmi == WMI.OCEANIA_EXPORT:
+      ret.flags |= MazdaFlagsSP.OCEANIA_CLUSTER
+
     vin_platform = platform_from_vin(stock_cp.carVin)
     if vin_platform is not None and vin_platform != str(candidate):
       carlog.warning({"event": "platformBundleVinMismatch", "bundle": str(candidate), "vin_platform": vin_platform,
@@ -96,21 +106,32 @@ class CarInterface(CarInterfaceBase):
 
     return ret
 
-  def update(self, can_packets: list[tuple[int, list[CanData]]]):
-    # The parser keeps signals only; the relays and the Auto Hold press need frames raw.
-    if self.CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC:
-      # card hands plain (address, dat, src) tuples, not CanData
-      for _, frames in can_packets:
-        for address, dat, src in frames:
-          if src == 2 and address == mazdacan.CRZ_CTRL_ADDR:
-            self.CS.cam_crz_ctrl = bytes(dat)
-            self.CS.cam_crz_ctrl_frames += 1
-          elif src == 2 and address == mazdacan.TRAFFIC_SIGNS_ADDR:
-            self.CS.cam_traffic_signs = bytes(dat)
-            self.CS.cam_traffic_signs_frames += 1
-          elif src == 0 and address == mazdacan.AUTO_HOLD_BTN_ADDR:
-            self.CS.auto_hold_btn = bytes(dat)
-            self.CS.auto_hold_btn_frames += 1
-          elif src == 0 and address == mazdacan.EPB_ADDR:
-            self.CS.auto_hold_armed = bool(dat[mazdacan.EPB_AUTO_HOLD_ARMED_BYTE] & mazdacan.EPB_AUTO_HOLD_ARMED_MASK)
+  def update(self, can_packets):
+    """Latch the camera's last CAM_LANEINFO payload for the white-wheel HUD gate and, on the non-MRCC trim, the raw
+    frames the relays and the Auto Hold press copy (the parser keeps signals only)."""
+    # card sends [(t, frames), ...]; the model tests send one bare (t, frames) tuple. CANParser.update takes both.
+    if can_packets and not isinstance(can_packets[0], (list, tuple)):
+      can_packets = [can_packets]
+    non_mrcc = self.CP.carFingerprint == CAR.MAZDA_CX5_2022_NON_MRCC
+    raw, received = self.CS.cam_laneinfo_raw, False
+    for _t, frames in can_packets:
+      # card passes plain (address, dat, src) tuples, tests pass CanData: both unpack the same way
+      for address, dat, src in frames:
+        if src == 2 and address == 0x440 and len(dat) == 8:
+          raw, received = bytes(dat), True
+        if not non_mrcc:
+          continue
+        if src == 2 and address == mazdacan.CRZ_CTRL_ADDR:
+          self.CS.cam_crz_ctrl = bytes(dat)
+          self.CS.cam_crz_ctrl_frames += 1
+        elif src == 2 and address == mazdacan.TRAFFIC_SIGNS_ADDR:
+          self.CS.cam_traffic_signs = bytes(dat)
+          self.CS.cam_traffic_signs_frames += 1
+        elif src == 0 and address == mazdacan.AUTO_HOLD_BTN_ADDR:
+          self.CS.auto_hold_btn = bytes(dat)
+          self.CS.auto_hold_btn_frames += 1
+        elif src == 0 and address == mazdacan.EPB_ADDR:
+          self.CS.auto_hold_armed = bool(dat[mazdacan.EPB_AUTO_HOLD_ARMED_BYTE] & mazdacan.EPB_AUTO_HOLD_ARMED_MASK)
+    self.CS.cam_laneinfo_raw = raw
+    self.CS.cam_laneinfo_stale_frames = 0 if received else self.CS.cam_laneinfo_stale_frames + 1
     return super().update(can_packets)

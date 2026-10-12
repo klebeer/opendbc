@@ -10,8 +10,9 @@ from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.longitudinal import BREAKAWAY_FRAMES, AdvertisedLead, StandstillHold
 from opendbc.car.mazda.radar_session import RadarSessionManager, RadarSessionState
 from opendbc.car.mazda.values import CarControllerParams, Buttons, MazdaFlags
+from opendbc.sunnypilot.car.mazda.values import MazdaFlagsSP
 
-from opendbc.sunnypilot.car.mazda.icbm import IntelligentCruiseButtonManagementInterface
+from opendbc.sunnypilot.car.mazda.icbm import BUTTONS, IntelligentCruiseButtonManagementInterface
 from opendbc.sunnypilot.car.stock_ecu import StockEcuState
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
@@ -19,6 +20,51 @@ LongCtrlState = structs.CarControl.Actuators.LongControlState
 
 # Send synthetic radar frames to both consumers; panda does not forward locally generated frames.
 LONG_BUSES = (0, 2)
+TJA_MRCC_MAX_TX_FRAMES = 3
+TJA_MRCC_RAW_OFF_CONFIRM_FRAMES = 5
+# The body ECU drops discrete presses faster than one per 200 ms (measured, docs/zoompilot/icbm.md);
+# the arm clears in PEDALS ~80 ms after a press plus the 50 ms confirm.
+TJA_MRCC_TX_PERIOD = 0.2  # s between undo presses
+# The press-induced arm appears ~80 ms after the press edge (docs/zoompilot/mazda-lateral.md).
+TJA_MRCC_ARM_WAIT_FRAMES = int(1.0 / DT_CTRL)
+# The white wheel waits this long on a fully-off, quiet cruise before it displays.
+MADS_WHITE_HUD_OFF_CONFIRM_FRAMES = int(0.5 / DT_CTRL)
+# The alert frame's cadence.
+HUD_ALERT_FRAMES = 50
+CANCEL_SETTLE_FRAMES = int(CarControllerParams.CANCEL_SETTLE_T / DT_CTRL)
+# The dash hands-on-wheel frame waits this long after lateral or cruise comes on: the driver is
+# on the button, and the EPS-standby banner (1.8 s) can outlive the block that raised it.
+DASH_STEER_WARNING_QUIET_FRAMES = int(2.0 / DT_CTRL)
+
+
+class DashSteerWarning:
+  """When the steerRequired alert also reaches the car's own dash.
+
+  The device alert is the primary channel and is never touched here. The dash frame (the
+  hands-on-wheel code in CAM_LANEINFO, see mazdacan.create_alert_command) mirrors the alert
+  only while openpilot is steering, which keeps it off the dash at a standstill and through an
+  EPS block; never inside the quiet window after lateral or cruise comes on; and, once the
+  driver cancels or touches the brake while the alert is up, not again until the alert clears.
+  The cluster chimes on the frame, so each rule is one chime less at a moment the driver is
+  already acting.
+  """
+
+  def __init__(self):
+    self.lat_active_prev = False
+    self.enabled_prev = False
+    self.brake_prev = False
+    self.quiet_until = 0
+    self.held = False
+
+  def update(self, frame: int, steer_required: bool, lat_active: bool, enabled: bool, brake_pressed: bool) -> bool:
+    if (lat_active and not self.lat_active_prev) or (enabled and not self.enabled_prev):
+      self.quiet_until = frame + DASH_STEER_WARNING_QUIET_FRAMES
+    if steer_required and ((self.enabled_prev and not enabled) or brake_pressed != self.brake_prev):
+      self.held = True
+    if not steer_required:
+      self.held = False
+    self.lat_active_prev, self.enabled_prev, self.brake_prev = lat_active, enabled, brake_pressed
+    return steer_required and lat_active and not self.held and frame >= self.quiet_until
 
 
 class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterface):
@@ -39,7 +85,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.apply_torque_last = 0
     self.driver_torque_samples: deque[float] = deque(maxlen=self.params.STEER_DRIVER_SAMPLES if self.eps_2022 else 1)
     self.packer = CANPacker(dbc_names[Bus.pt])
-    self.brake_counter = 0
+    self.cancel_counter = 0
     self.stop_and_go = StandstillHold()
     self.lead_adv = AdvertisedLead()
     self.long_counter = 0
@@ -48,29 +94,28 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     self.accel_last = 0.
     self.release_ramp = None
     self.breakaway_frames = 0
-    # The camera's own TJA/CTS is pressed off on its bus whenever it is armed, per arming
-    # episode: the camera re-arms on the driver's own TJA press (that press is also the MADS
-    # switch on declared cars) and drops its arm by itself at times.
-    self.tja_press_count = 0
-    self.tja_press_frame: int | None = None
-    self.tja_episode_alerted = False
     self.auto_hold_btn_frames_sent = 0
     self.auto_hold_done = False
     self.auto_hold_attempts = 0
     self.auto_hold_press_frame: int | None = None
     self.auto_hold_release_frame: int | None = None
+    self.tja_button_prev = False
+    self.dash_steer_warning = DashSteerWarning()
+    self.dash_warning_on_bus = False
+    self.mrcc_armed_prev: bool | None = None
+    self.mrcc_undo_pending = False
+    self.mrcc_undo_saw_armed = False
+    self.mrcc_undo_frames = 0
+    self.mrcc_raw_off_frames = 0
+    self.mrcc_arm_wait_frames = 0
+    # The white wheel rides the alert frame; on_bus tracks that the white bit is on the wire.
+    self.mads_white_hud_off_frames = 0
+    self.mads_white_hud_on_bus = False
 
   def update(self, CC, CC_SP, CS, now_nanos):
     can_sends = []
 
     apply_torque = 0
-
-    # The measured EPS uses a speed-dependent STEER_MAX.
-    if self.eps_2022:
-      steer_max = round(float(np.interp(CS.out.vEgoRaw, self.params.STEER_MAX_LOOKUP[0],
-                                         self.params.STEER_MAX_LOOKUP[1])))
-    else:
-      steer_max = self.params.STEER_MAX
 
     self.driver_torque_samples.append(CS.out.steeringTorque)
     if CS.lkas_rejected:
@@ -86,10 +131,10 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
 
     if CC.latActive:
       # calculate steer and also set limits due to driver torque
-      new_torque = int(round(CC.actuators.torque * steer_max))
+      new_torque = int(round(CC.actuators.torque * self.params.STEER_MAX))
 
       # Clamp to applied EPS authority so controlsd can detect saturation. Keep this separate
-      # from steer_max because torque parameter scaling depends on steer_max.
+      # from STEER_MAX because the torque parameters are expressed on STEER_MAX.
       if self.eps_2022:
         eps_ceiling = round(float(np.interp(CS.out.vEgoRaw, self.params.EPS_CEILING_LOOKUP[0],
                                             self.params.EPS_CEILING_LOOKUP[1])))
@@ -103,7 +148,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
         driver_torque = max(self.driver_torque_samples) + margin
 
       apply_torque = apply_driver_steer_torque_limits(new_torque, self.apply_torque_last,
-                                                      driver_torque, self.params, steer_max)
+                                                      driver_torque, self.params)
 
     # Stop requesting torque while carstate says the EPS will not take it: after the
     # non-delivery latch, or through its first engagement of the cycle. Recovery ramps from zero.
@@ -113,34 +158,28 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     # Do not cancel a stock MRCC engagement while the stock radar still owns the bus.
     stock_mrcc_owns_cruise = self.CP.openpilotLongitudinalControl and not CS.radar_was_silenced
     if CC.cruiseControl.cancel and not stock_mrcc_owns_cruise:
-      # If brake is pressed, let us wait >70ms before trying to disable crz to avoid
-      # a race condition with the stock system, where the second cancel from openpilot
-      # will disable the crz 'main on'. crz ctrl msg runs at 50hz. 70ms allows us to
-      # read 3 messages and most likely sync state before we attempt cancel.
-      self.brake_counter = self.brake_counter + 1
-      if self.frame % 10 == 0 and not (CS.out.brakePressed and self.brake_counter < 7):
+      # A CANCEL landing with cruise already off is the stock main-off. The car answers its own
+      # cancels (brake, the wheel button) 60 to 90 ms after openpilot disengages on them, and the
+      # request falls with cruise; upstream waited 70 ms for the brake only. Wait it out for all.
+      self.cancel_counter = self.cancel_counter + 1
+      if self.frame % 10 == 0 and self.cancel_counter >= CANCEL_SETTLE_FRAMES:
         # Cancel Stock ACC if it's enabled while OP is disengaged
         # Send at a rate of 10hz until we sync with stock ACC state
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.CANCEL))
     else:
-      self.brake_counter = 0
+      self.cancel_counter = 0
       if self.resume_requested(CC) and self.frame % 5 == 0:
         can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.RESUME))
+
+    if self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON:
+      can_sends.extend(self.update_mrcc_cleanup(CC, CC_SP, CS))
 
     self.apply_torque_last = apply_torque
 
     if self.CP.openpilotLongitudinalControl:
       can_sends.extend(self.update_longitudinal(CC, CC_SP, CS))
 
-    can_sends.extend(self.update_camera_tja(CC, CS))
-
-    # send HUD alerts
-    if self.frame % 50 == 0:
-      ldw = CC.hudControl.visualAlert == VisualAlert.ldw
-      steer_required = CC.hudControl.visualAlert == VisualAlert.steerRequired
-      # TODO: find a way to silence audible warnings so we can add more hud alerts
-      steer_required = steer_required and CS.lkas_allowed_speed
-      can_sends.append(mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, ldw, steer_required))
+    can_sends.extend(self.update_hud(CC, CC_SP, CS))
 
     # send steering command
     can_sends.append(mazdacan.create_steering_control(self.packer, self.CP,
@@ -160,13 +199,15 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       self.cam_traffic_signs_frames_sent = CS.cam_traffic_signs_frames
     can_sends.extend(self.update_auto_hold(CC_SP, CS))
 
-    # Suppress ICBM while cancel or resume is active to avoid competing button frames.
-    icbm_suppress = CC.cruiseControl.cancel or CC.cruiseControl.resume or CS.cancel_button == 1
+    # Suppress ICBM while cancel/resume is active or the MRCC cleanup owns CRZ_BTNS:
+    # the wheel's press pattern owns the counter stream until release.
+    icbm_suppress = (CC.cruiseControl.cancel or CC.cruiseControl.resume or CS.cancel_button == 1 or
+                     self.mrcc_undo_pending or CS.tja_button == 1)
     if not icbm_suppress:
       can_sends.extend(IntelligentCruiseButtonManagementInterface.update(self, CC_SP, CS, self.packer, self.frame, self.last_button_frame))
 
     new_actuators = CC.actuators.as_builder()
-    new_actuators.torque = apply_torque / steer_max
+    new_actuators.torque = apply_torque / self.params.STEER_MAX
     new_actuators.torqueOutputCan = apply_torque
     # Report the command sent on the wire after clipping, holds, slew, and overrides.
     new_actuators.accel = self.accel_last
@@ -181,38 +222,88 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     that silences nothing."""
     return self.radar_session.status if self.CP.openpilotLongitudinalControl else StockEcuState.NOT_NEEDED
 
-  def update_camera_tja(self, CC, CS):
-    """Press the camera's own TJA/CTS off, on its bus, whenever it is armed.
-
-    The two lane-centering systems must never run at once, and with a panda fitted the camera
-    is never needed: the panda drops the camera's 0x243 while openpilot controls, but the camera
-    keeps its state and takes the wheel the moment lateral drops (route 00000018--5655da2c1c seg
-    15), and a MADS-off press re-arms it so stock TJA engages a few seconds later. So the press
-    is not gated on lateral. One CRZ_BTNS with the TJA bit over the wheel's idle pattern, counter
-    plus one, on bus 2; the forwarded real stream supplies the release and the camera acts on the
-    press edge (tja_cts_route_29). At least one 0x440 period between presses, three per arming
-    episode; the episode resets when the camera reads 0, so a driver re-arming it is handled
-    again. Not gated on the button declaration: any Mazda with the camera armed gets the same
-    press. The press only reaches the camera, so it cannot arm or disarm MRCC in the body.
-    """
+  def update_mrcc_cleanup(self, CC, CC_SP, CS):
+    # Undo the MRCC arm a physical TJA press causes: the wheel's press reaches every bus-0
+    # ECU directly, so the button the driver declared as the lateral switch also arms cruise.
+    # Answer with the driver's own MRCC master press until raw PEDALS confirms the arm is gone.
     can_sends = []
-    if CS.stock_tja == 0:
-      self.tja_press_count = 0
-      self.tja_press_frame = None
-      self.tja_episode_alerted = False
+
+    raw_armed = bool(CS.mrcc_armed_raw)
+    # PEDALS drops both cruise bits through a brake transition; the filtered state bridges
+    # those samples, and only sustained raw-off is authoritative.
+    self.mrcc_raw_off_frames = 0 if raw_armed else self.mrcc_raw_off_frames + 1
+    raw_off_confirmed = self.mrcc_raw_off_frames >= TJA_MRCC_RAW_OFF_CONFIRM_FRAMES
+    # PEDALS holds both cruise bits low under braking: the clock restarts there and runs
+    # again once the pedal is off.
+    self.mrcc_arm_wait_frames = 0 if CS.out.brakePressed else self.mrcc_arm_wait_frames + 1
+    if self.CP.openpilotLongitudinalControl:
+      filtered_armed = CS.cruise_available
     else:
-      interval = int(CarControllerParams.TJA_PRESS_INTERVAL_T / DT_CTRL)
-      due = self.tja_press_frame is None or self.frame - self.tja_press_frame >= interval
-      if due and self.tja_press_count < CarControllerParams.TJA_PRESS_MAX:
-        can_sends.append(mazdacan.create_button_cmd(self.packer, self.CP, CS.crz_btns_counter, Buttons.TJA, bus=2))
-        self.tja_press_count += 1
-        self.tja_press_frame = self.frame
-      elif due and CC.latActive and not self.tja_episode_alerted:
-        # The camera did not clear while openpilot steers: keep steering (its command is
-        # blocked) and tell the driver once. carstate turns this into the one-shot stockLkas
-        # pulse. With lateral off the camera steering is stock behaviour, nothing to warn about.
-        CS.stock_cts_stuck = True
-        self.tja_episode_alerted = True
+      filtered_armed = CS.out.cruiseState.available
+    mrcc_armed = raw_armed or (filtered_armed and not raw_off_confirmed)
+
+    if CS.tja_button and not self.tja_button_prev:
+      # A press before the previous press's arm reconciled sees that arm as its own
+      # artifact, not the driver's baseline.
+      if self.mrcc_undo_pending:
+        self.mrcc_undo_frames = 0
+      else:
+        # PEDALS can already show the press-induced arm in the same cycle as the edge; the
+        # previous stable sample is the state that existed before the press.
+        armed_before_press = self.mrcc_armed_prev if self.mrcc_armed_prev is not None else mrcc_armed
+        self.mrcc_undo_pending = not armed_before_press
+      self.mrcc_undo_saw_armed = False
+      self.mrcc_arm_wait_frames = 0
+    self.tja_button_prev = bool(CS.tja_button)
+    self.mrcc_armed_prev = mrcc_armed
+
+    # The arm is fully reconciled; the budget returns for the next press.
+    if not mrcc_armed and not CS.cruise_enabled and not CS.out.cruiseState.enabled:
+      self.mrcc_undo_frames = 0
+
+    if not self.mrcc_undo_pending:
+      return can_sends
+
+    self.mrcc_undo_saw_armed |= raw_armed
+
+    # The driver's own cruise presses own CRZ_BTNS from this cycle on, and restoring
+    # stock ECU ownership changes who owns the arm.
+    driver_activity = (CS.cancel_button or CS.resume_button or CS.accel_button or CS.decel_button or
+                       CS.mrcc_button or CS.distance_button)
+    if driver_activity or CS.radar_handback_active or CC_SP.stockEcuHandBack:
+      self.mrcc_undo_pending = False
+      return can_sends
+
+    # The arm never appeared: a takeover already disarmed it, or this car does not arm
+    # through the press. Past the bounded brake-free wait, stand down.
+    if not self.mrcc_undo_saw_armed:
+      if self.mrcc_arm_wait_frames >= TJA_MRCC_ARM_WAIT_FRAMES:
+        self.mrcc_undo_pending = False
+      return can_sends
+
+    if raw_off_confirmed:
+      self.mrcc_undo_pending = False
+      return can_sends
+
+    # openpilot's own cancel or resume interleaves button frames; wait it out rather
+    # than race the counter stream.
+    if CC.cruiseControl.cancel or CC.cruiseControl.resume:
+      return can_sends
+
+    # Never inside the driver's held press.
+    if CS.tja_button:
+      return can_sends
+
+    # One press per body-paced slot, within the episode budget; never while PEDALS reads disarmed,
+    # where the master press would arm instead of disarm. last_button_frame also paces ICBM.
+    if raw_armed and self.mrcc_undo_frames < TJA_MRCC_MAX_TX_FRAMES and \
+       (self.frame - self.last_button_frame) * DT_CTRL > TJA_MRCC_TX_PERIOD:
+      can_sends.append(mazdacan.create_mrcc_off_cmd(self.packer, CS.crz_btns_counter))
+      self.last_button_frame = self.frame
+      self.mrcc_undo_frames += 1
+      if self.mrcc_undo_frames >= TJA_MRCC_MAX_TX_FRAMES:
+        self.mrcc_undo_pending = False
+
     return can_sends
 
   def update_auto_hold(self, CC_SP, CS):
@@ -252,6 +343,70 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       return []
     return [mazdacan.create_auto_hold_press(CS.auto_hold_btn)]
 
+  def update_hud(self, CC, CC_SP, CS):
+    """The alert frame at 2 Hz, mirroring the camera's own HUD state.
+
+    The hands-on-wheel warning is the steerRequired alert above the LKAS speed floor, as
+    DashSteerWarning lets it through.
+
+    On a TJA-declared car with MADS active and cruise fully off, the white-wheel TJA=2
+    state is XORed into the camera's current payload, but only onto an exact allowlisted
+    idle base: TJA=2 is not display-only, the body reads the same frame. Every cruise
+    interaction fails closed, and a white wheel HUD state that became unsafe is withdrawn
+    immediately, outside the cadence.
+    """
+    if self.CP.openpilotLongitudinalControl:
+      filtered_available, filtered_enabled = CS.cruise_available, CS.cruise_enabled
+    else:
+      filtered_available, filtered_enabled = CS.out.cruiseState.available, CS.out.cruiseState.enabled
+
+    session_ambiguous = CS.radar_handback_active or CC_SP.stockEcuHandBack
+    mrcc_off = (not session_ambiguous and not CS.mrcc_armed_raw and
+                not filtered_available and not filtered_enabled)
+
+    # Every button a TJA wheel carries: TJA, MRCC, SET+/-, RES, DISTANCE, plus the
+    # synthesized ICBM set presses and openpilot's own cancel/resume.
+    button_activity = (CS.tja_button or CS.mrcc_button or CS.cancel_button or CS.resume_button or
+                       CS.accel_button or CS.decel_button or CS.distance_button or
+                       CC_SP.intelligentCruiseButtonManagement.sendButton in BUTTONS or
+                       CC.cruiseControl.cancel or CC.cruiseControl.resume)
+
+    visual_alert = CC.hudControl.visualAlert
+    steer_required = visual_alert == VisualAlert.steerRequired
+    # TODO: find a way to silence audible warnings so we can add more hud alerts
+    steer_required = steer_required and CS.lkas_allowed_speed
+    steer_required = self.dash_steer_warning.update(self.frame, steer_required, CC.latActive, CC.enabled,
+                                                    CS.out.brakePressed)
+
+    fsc_raw = CS.cam_laneinfo_raw
+    hud_base = mazdacan.white_hud_allowlist_base(fsc_raw)
+    white_allowed = (
+      bool(self.CP_SP.flags & MazdaFlagsSP.TJA_BUTTON) and
+      CC_SP.mads.active and
+      CS.cam_laneinfo_live and
+      hud_base is not None and
+      visual_alert == VisualAlert.none and
+      not button_activity and
+      mrcc_off
+    )
+    if white_allowed:
+      self.mads_white_hud_off_frames = min(self.mads_white_hud_off_frames + 1, MADS_WHITE_HUD_OFF_CONFIRM_FRAMES)
+    else:
+      self.mads_white_hud_off_frames = 0
+    white = white_allowed and self.mads_white_hud_off_frames >= MADS_WHITE_HUD_OFF_CONFIRM_FRAMES
+
+    # Preserve the normal 2 Hz cadence; the exception is the immediate withdraw of anything
+    # the last frame asserted.
+    withdraw_now = (self.mads_white_hud_on_bus and not white) or (self.dash_warning_on_bus and not steer_required)
+    if self.frame % HUD_ALERT_FRAMES == 0 or withdraw_now:
+      alert = mazdacan.create_alert_command(self.packer, CS.cam_laneinfo, visual_alert == VisualAlert.ldw, steer_required)
+      payload = hud_base if white else alert[1]
+      alert = (alert[0], mazdacan.apply_mads_white_hud(fsc_raw, payload, white), alert[2])
+      self.mads_white_hud_on_bus = mazdacan.is_mads_white_hud(alert[1])
+      self.dash_warning_on_bus = steer_required
+      return [alert]
+    return []
+
   def resume_requested(self, CC) -> bool:
     """The resume button belongs to the stock-longitudinal path alone. Under openpilot longitudinal
     the hold is released in-protocol (stop bits drop, RESUME_UNLATCHING pulses, the command ramps),
@@ -290,7 +445,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
     long_engaged = CC.enabled and control_ready
     long_active = CC.longActive and control_ready
     sm = self.stop_and_go
-    sm.update(long_engaged, stopping, CS.out.standstill, CC.actuators.accel, CS.brake_hold,
+    sm.update(long_engaged, stopping, CS.out.standstill, CC.actuators.accel, CS.body_hold,
               gas_pressed=CS.out.gasPressed)
     # Lead advertisement represents perception and is independent of engagement.
     self.lead_adv.update(CC.hudControl.leadVisible, CC_SP.leadOne.dRel,
@@ -318,9 +473,9 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
                                     accel + CarControllerParams.ACCEL_BREAKAWAY_OVERSHOOT))
       if self.release_ramp is not None and (self.release_ramp < accel or breakaway):
         # The release ramp owns the command until it reaches the plan. Body-latched holds remain
-        # at the relaxed command until GEAR.BRAKE_HOLD clears.
+        # at the relaxed command until the body lets go.
         accel = self.release_ramp
-        if not (sm.latched_release and CS.brake_hold):
+        if not (sm.latched_release and CS.body_hold):
           # Follow a falling plan ceiling at the winddown limit.
           self.release_ramp = max(min(self.release_ramp + CarControllerParams.ACCEL_RELEASE_RAMP * DT_CTRL, ramp_ceiling),
                                   self.release_ramp + CarControllerParams.ACCEL_WINDDOWN_LIMIT)
@@ -360,8 +515,12 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
       # openpilot engagement. CarState's public availability is already revoked.
       acc_available = CS.cruise_available if session_state == RadarSessionState.HANDBACK and bus_healthy else \
                       CS.out.cruiseState.available and control_ready
-      # Mirror the driver's distance setting; stock defaults to gap 2.
-      gap = (int(CC.hudControl.leadDistanceBars) or 2) if (long_engaged or acc_available) else 0
+      # Mirror the driver's distance setting on the dash; stock shows 2 bars by default.
+      # leadDistanceBars counts up, 1 closest to 3 farthest, and DISTANCE_SETTING counts down
+      # from 4 bars, so the cluster lights 5 - DISTANCE_SETTING bars (stock: the wheel's
+      # DISTANCE_LESS raises the raw, 576 segments).
+      bars = int(CC.hudControl.leadDistanceBars) or 2
+      gap = (5 - bars) if (long_engaged or acc_available) else 0
       acc_active_2 = sm.acc_active_2 if long_engaged else False
       for bus in LONG_BUSES:
         can_sends.append(mazdacan.create_acc_command(self.packer, bus, self.long_counter, accel,
@@ -370,7 +529,7 @@ class CarController(CarControllerBase, IntelligentCruiseButtonManagementInterfac
                                                      stopping=sm.stop_bits, resume_unlatching=sm.resume_unlatching))
         can_sends.append(mazdacan.create_crz_ctrl(self.packer, bus, long_engaged, acc_available, gap,
                                                   self.lead_adv.has_lead, self.lead_adv.ctrl_phase,
-                                                  acc_active_2))
+                                                  acc_active_2, hbc_request=CS.hbc_request))
       self.long_counter += 1
 
     return can_sends

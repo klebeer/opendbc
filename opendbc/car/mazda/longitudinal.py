@@ -13,6 +13,7 @@ RESUME_UNLATCH_LATCHED_FRAMES = int(CarControllerParams.RESUME_UNLATCH_LATCHED_T
 RESUME_REPULSE_FRAMES = int(CarControllerParams.RESUME_REPULSE_T / DT_CTRL)
 LEAD_DEBOUNCE_FRAMES = int(CarControllerParams.LEAD_DEBOUNCE_T / DT_CTRL)
 RELEASE_DEBOUNCE_FRAMES = int(CarControllerParams.RELEASE_DEBOUNCE_T / DT_CTRL)
+RELEASE_ACCEL = CarControllerParams.RELEASE_ACCEL
 BREAKAWAY_FRAMES = int(CarControllerParams.ACCEL_BREAKAWAY_T / DT_CTRL)
 
 
@@ -37,15 +38,17 @@ class StandstillHold:
     self.repulsed = False
 
   def update(self, long_engaged: bool, stopping: bool, standstill: bool,
-             plan_accel: float, brake_hold: bool, gas_pressed: bool) -> None:
+             plan_accel: float, body_hold: bool, gas_pressed: bool) -> None:
     self.just_released = False
     if not long_engaged:
       self._reset()
       return
 
     was_holding = self.holding
-    # Debounce plan movement requests; driver throttle releases the hold immediately.
-    self.release_frames = self.release_frames + 1 if plan_accel > 0. else 0
+    # Debounce plan movement requests: opening a hold takes RELEASE_ACCEL, keeping it open any
+    # positive plan. Driver throttle releases the hold immediately.
+    release_accel = RELEASE_ACCEL if was_holding else 0.
+    self.release_frames = self.release_frames + 1 if plan_accel > release_accel else 0
     plan_wants_go = self.release_frames >= RELEASE_DEBOUNCE_FRAMES
     # Keep STOPPING off once the plan or driver requests acceleration.
     release = gas_pressed or plan_wants_go
@@ -64,7 +67,7 @@ class StandstillHold:
       self.repulsed = False
 
     # Retry one unanswered body-latched release so a positive plan cannot remain blocked.
-    if self.latched_release and not self.holding and standstill and brake_hold and not gas_pressed:
+    if self.latched_release and not self.holding and standstill and body_hold and not gas_pressed:
       self.latched_frames += 1
       if self.latched_frames >= RESUME_REPULSE_FRAMES and not self.repulsed and self.unlatch_frames == 0:
         self.unlatch_frames = RESUME_UNLATCH_LATCHED_FRAMES
@@ -73,7 +76,7 @@ class StandstillHold:
       self.latched_frames = 0
 
     # Body ownership is valid only while the controller still requests a hold.
-    self.car_has_hold = self.holding and standstill and brake_hold
+    self.car_has_hold = self.holding and standstill and body_hold
 
   @property
   def stop_bits(self) -> bool:

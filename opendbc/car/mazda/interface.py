@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 from opendbc.car import Bus, get_safety_config, structs
-from opendbc.car.can_definitions import CanData
 from opendbc.car.carlog import carlog
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarInterfaceBase
@@ -18,6 +17,11 @@ class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+  def __init__(self, CP, CP_SP):
+    CarInterfaceBase.__init__(self, CP, CP_SP)
+    # The controller runs the radar session; carstate reads its outcome on the next update.
+    self.CS.radar_session = self.CC.radar_session
 
   @staticmethod
   def configure_torque_tune(candidate, tune, steering_angle_deadzone_deg=0.0):
@@ -48,15 +52,14 @@ class CarInterface(CarInterfaceBase):
     # fingerprint on an unlisted older EPS then gets the floor and its banner, not a silent latch.
     eps_fw = {fw.fwVersion for fw in car_fw if fw.ecu == 'eps'}
     steer_to_zero = not eps_fw.isdisjoint(STEER_TO_ZERO_EPS_FW) or (not eps_fw and candidate in STEER_TO_ZERO_PLATFORMS)
+    # The panda enforces the measured envelope the controller runs on every gen1 EPS.
+    ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.EPS_HW.value
     if steer_to_zero:
-      # Select panda's matching torque envelope from the detected EPS.
       ret.flags |= MazdaFlags.STEER_TO_ZERO_EPS.value
-      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.STEER_TO_ZERO_EPS.value
     else:
       # Same envelope and tune; only the firmware's floor, latch semantics and alpha long differ.
       ret.minSteerSpeed = LKAS_LIMITS.DISABLE_SPEED * CV.KPH_TO_MS
       ret.flags |= MazdaFlags.LEGACY_FW_EPS.value
-      ret.safetyConfigs[0].safetyParam |= MazdaSafetyFlags.LEGACY_FW_EPS.value
 
     # Alpha-long silences the radar and stands in for it, so it needs the radar's dialect,
     # not its tracks: offer it wherever the platform's radar speaks the 2022 family dialect
@@ -92,12 +95,14 @@ class CarInterface(CarInterfaceBase):
   def _get_params_sp(stock_cp: structs.CarParams, ret: structs.CarParamsSP, candidate, fingerprint: dict[int, dict[int, int]],
                      car_fw: list[structs.CarParams.CarFw], alpha_long: bool, is_release_sp: bool, docs: bool) -> structs.CarParamsSP:
     ret.intelligentCruiseButtonManagementAvailable = True
+    # MRCC holds 30 km/h at its floor in either unit mode: an imperial dash shows 19 (18.64 mph).
+    ret.zoompilot.minimumSetSpeed = 30. * CV.KPH_TO_MS
 
     # A carried-forward CarPlatformBundle can disagree with the physical car after a
     # hardware swap or a branch switch without reinstall.
     # Oceania clusters over-read the held cruise speed (MazdaFlagsSP.OCEANIA_CLUSTER).
     if is_valid_vin(stock_cp.carVin) and Vin(stock_cp.carVin).wmi == WMI.OCEANIA_EXPORT:
-      ret.flags |= MazdaFlagsSP.OCEANIA_CLUSTER
+      ret.flags |= MazdaFlagsSP.OCEANIA_CLUSTER.value
 
     vin_platform = platform_from_vin(stock_cp.carVin)
     if vin_platform is not None and vin_platform != str(candidate):
@@ -107,8 +112,8 @@ class CarInterface(CarInterfaceBase):
     return ret
 
   def update(self, can_packets):
-    """Latch the camera's last CAM_LANEINFO payload for the white-wheel HUD gate and, on the non-MRCC trim, the raw
-    frames the relays and the Auto Hold press copy (the parser keeps signals only)."""
+    """Latch the camera's last CAM_LANEINFO payload and staleness: carstate's freshness and the white-wheel HUD gate.
+    On the non-MRCC trim, also the raw frames the relays and the Auto Hold press copy (the parser keeps signals only)."""
     # card sends [(t, frames), ...]; the model tests send one bare (t, frames) tuple. CANParser.update takes both.
     if can_packets and not isinstance(can_packets[0], (list, tuple)):
       can_packets = [can_packets]

@@ -2,14 +2,15 @@
 import unittest
 
 from opendbc.car.structs import CarParams
-from opendbc.safety.tests.libsafety import libsafety_py
 import opendbc.safety.tests.common as common
-from opendbc.safety.tests.common import CANPackerSafety
 
 LANE_KEEP_ASSIST = 0x3F2
 
 
 class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
+  DBC = "psa_aee2010_r3"
+  SAFETY_MODEL = CarParams.SafetyModel.psa
+
   RELAY_MALFUNCTION_ADDRS = {0: (LANE_KEEP_ASSIST,)}
   FWD_BLACKLISTED_ADDRS = {2: [LANE_KEEP_ASSIST]}
   TX_MSGS = [[1010, 0]]
@@ -24,12 +25,6 @@ class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
   ANGLE_RATE_BP = [0., 5., 25.]
   ANGLE_RATE_UP = [2.5, 1.5, .2]
   ANGLE_RATE_DOWN = [5., 2., .3]
-
-  def setUp(self):
-    self.packer = CANPackerSafety("psa_aee2010_r3")
-    self.safety = libsafety_py.libsafety
-    self.safety.set_safety_hooks(CarParams.SafetyModel.psa, 0)
-    self.safety.init_tests()
 
   def _angle_cmd_msg(self, angle: float, enabled: bool):
     values = {"SET_ANGLE": angle, "TORQUE_FACTOR": 100 if enabled else 0}
@@ -76,14 +71,29 @@ class TestPsaSafetyBase(common.CarSafetyTest, common.AngleSteeringSafetyTest):
     msg[0].data[6] = 0xAB
     self.assertTrue(self._rx(msg))
 
+  def _ign_msg(self, bus, counter, ign):
+    return common.make_msg(bus, 0x432, dat=bytes([0, counter, 0, 0, 0, 0, ign, 0]))
+
+  def test_ignition_on(self):
+    for bus in (0, 2):
+      for i in range(16):
+        self.safety.init_tests()
+        self.safety.ignition_can_hook(self._ign_msg(bus, i, 1))
+        self.assertFalse(self.safety.get_ignition_can())
+        self.safety.ignition_can_hook(self._ign_msg(bus, (i + 1) % 16, 1))
+        self.assertTrue(self.safety.get_ignition_can())
+
+  def test_ignition_off(self):
+    for bus in (0, 2):
+      self.safety.ignition_can_hook(self._ign_msg(bus, 0, 1))
+      self.safety.ignition_can_hook(self._ign_msg(bus, 1, 1))
+      self.assertTrue(self.safety.get_ignition_can())
+      self.safety.ignition_can_hook(self._ign_msg(bus, 2, 0))
+      self.assertFalse(self.safety.get_ignition_can())
+
 
 class TestPsaStockSafety(TestPsaSafetyBase):
-
-  def setUp(self):
-    self.packer = CANPackerSafety("psa_aee2010_r3")
-    self.safety = libsafety_py.libsafety
-    self.safety.set_safety_hooks(CarParams.SafetyModel.psa, 0)
-    self.safety.init_tests()
+  pass
 
 
 if __name__ == "__main__":

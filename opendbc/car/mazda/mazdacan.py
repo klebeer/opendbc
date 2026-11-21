@@ -1,5 +1,5 @@
 from opendbc.car.can_definitions import CanData
-from opendbc.car.mazda.values import Buttons, MazdaFlags
+from opendbc.car.mazda.values import Buttons, CarControllerParams, MazdaFlags
 
 # Captured empty radar tracks required by the body ECU for stop-and-go. Only the counter
 # nibble changes.
@@ -58,7 +58,7 @@ def create_acc_command(packer, bus, counter, accel, *, long_active, acc_availabl
     "ERROR_STATUS": 1,
     "STATIC_1": 0x7ff,
     "CTR": counter % 16,
-    "ACCEL_CMD": accel if long_active else 4.094,  # stock non-controlling sentinel
+    "ACCEL_CMD": accel if long_active else 8190 * CarControllerParams.ACCEL_CMD_LSB - 4.,  # stock non-controlling sentinel, raw 8190
     "NEW_SIGNAL_7": int(long_active or acc_available),
   }
   if long_active:
@@ -116,10 +116,12 @@ def create_steering_control(packer, CP, frame, apply_torque, lkas):
 
   # copy values from camera
   b1 = int(lkas["BIT_1"])
-  er1 = int(lkas["ERR_BIT_1"])
+  # Never the camera's error bits: alone they are sun glare, and the EPS stops assisting on them
+  # (docs/zoompilot/mazda-lateral.md, "LKAS_FAULT and the camera's ERR_BIT_1").
+  er1 = 0
   lnv = 0
   ldw = 0
-  er2 = int(lkas["ERR_BIT_2"])
+  er2 = 0
 
   # Some older models do have these, newer models don't.
   # Either way, they all work just fine if set to zero.

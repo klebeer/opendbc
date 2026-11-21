@@ -13,7 +13,7 @@ import pytest
 from opendbc.car import DT_CTRL
 from opendbc.car.mazda import mazdacan
 from opendbc.car.mazda.longitudinal import (BREAKAWAY_FRAMES, LEAD_HIDE_FRAMES, LEAD_SHOW_FRAMES, RELEASE_DEBOUNCE_FRAMES,
-                                            RESUME_REPULSE_FRAMES, RESUME_UNLATCH_LATCHED_FRAMES, LeadIcon)
+                                            RELEASE_SHAPE_FRAMES, RESUME_REPULSE_FRAMES, RESUME_UNLATCH_LATCHED_FRAMES, LeadIcon)
 from opendbc.car.mazda.tests.conftest import (CRZ_CTRL, CRZ_INFO, RADAR_STATIC, RADAR_UDS, LongCtrlState, accel_cmd_raw,
                                               crz_ctrl_lead, crz_info, frame, parse_frame, step_long)
 from opendbc.car.mazda.values import CarControllerParams
@@ -93,7 +93,7 @@ def test_gap_setting_mirrors_driver(cc, cs, bars, wire):
 @pytest.mark.parametrize("lead_visible", [True, False])
 @pytest.mark.parametrize("kwargs, bucket", [
   (dict(accel=0.5), 2),
-  (dict(long_state=STOPPING, accel=-1.024, standstill=True), 3),
+  (dict(long_state=STOPPING, accel=-1.0, standstill=True), 3),
   (dict(enabled=False, long_active=False, accel=0., long_state=OFF), 2),
 ], ids=["following", "stopped", "disengaged"])
 def test_lead_shows_on_the_dash_but_not_in_the_tracks(cc, cs, kwargs, bucket, lead_visible):
@@ -131,7 +131,7 @@ def test_stop_emits_hold_then_relaxes(cc, cs):
   # matter how long the stop lasts (the creep-into-the-lead regression)
   cmds = []
   for _ in range(seconds(30.0)):
-    cmd = accel_cmd_raw(step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True))
+    cmd = accel_cmd_raw(step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True))
     if cmd is not None:
       cmds.append(cmd)
   settled = cmds[len(cmds) // 2:]
@@ -140,7 +140,7 @@ def test_stop_emits_hold_then_relaxes(cc, cs):
   # once the body ECU takes the hold over, stock stops asking for the brakes and so do we
   relaxed = []
   for _ in range(seconds(1.0)):
-    cmd = accel_cmd_raw(step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True, body_hold=True))
+    cmd = accel_cmd_raw(step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True, body_hold=True))
     if cmd is not None:
       relaxed.append(cmd)
   assert relaxed and set(relaxed) == {round(CarControllerParams.ACCEL_HOLD_LATCHED * 1000)}
@@ -176,7 +176,7 @@ def test_command_slew_is_rate_limited(cc, cs):
   assert cc.accel_last == pytest.approx(-2.0, rel=1e-6, abs=1e-12)
 
   # plan jumps straight to +1.0: the command must ramp, not step; brake release at the windup
-  # limit, then the positive part at stock's rolling build rate
+  # limit, then the positive part at the town build rate
   prev = cc.accel_last
   for _ in range(5):
     step_long(cc, cs, accel=1.0, cruise_engaged=True, v_ego=10.)
@@ -187,7 +187,7 @@ def test_command_slew_is_rate_limited(cc, cs):
   prev = cc.accel_last
   for _ in range(5):
     step_long(cc, cs, accel=1.0, cruise_engaged=True, v_ego=10.)
-    assert cc.accel_last - prev == pytest.approx(0.8 * DT_CTRL, abs=1e-6)
+    assert cc.accel_last - prev == pytest.approx(CarControllerParams.ACCEL_BUILD_V[0] * DT_CTRL, abs=1e-6)
     prev = cc.accel_last
 
   # and the other way, at the looser winddown limit
@@ -200,12 +200,14 @@ def test_command_slew_is_rate_limited(cc, cs):
     prev = cc.accel_last
 
 
-def test_build_rate_follows_stock_by_speed(cc, cs):
-  """Stock pulls away from a stop at its 1.25 m/s3 release ramp and builds accel at 0.6 m/s3 once
-  rolling (+12 raw per 50 Hz frame, 99.3% of rising stock frames across 158 routes); rolling is
-  deliberately a third quicker here. The build rate governs the positive region only; brake
+def test_build_rate_by_speed(cc, cs):
+  """In town the positive command builds at 3.0 m/s3, inside the 3-4 m/s3 other ports send. From
+  16 m/s it follows stock MRCC (0.59 m/s3 once rolling, +12 raw per 50 Hz frame, 99.3% of rising stock
+  frames across 158 routes) to hold the gear. The build rate governs the positive region only; brake
   release below zero keeps the windup limit."""
-  for v_ego, jerk in ((0., 1.25), (3., 1.25), (4.5, 1.025), (6., 0.8), (20., 0.8)):
+  town = CarControllerParams.ACCEL_BUILD_V[0]
+  for v_ego, jerk in ((0., town), (6., town), (12., town), (14., (town + 0.8) / 2), (16., 0.8), (18., 0.7), (20., 0.6),
+                      (30., 0.6)):
     cc.accel_last = 0.
     step_long(cc, cs, accel=2.0, cruise_engaged=True, v_ego=v_ego)
     assert cc.accel_last == pytest.approx(jerk * DT_CTRL, abs=1e-6), f"v_ego={v_ego}"
@@ -229,10 +231,11 @@ def test_throttle_lift_follows_stock_but_braking_does_not_wait(cc, cs):
   assert cc.accel_last - prev == pytest.approx(CarControllerParams.ACCEL_WINDDOWN_LIMIT, abs=1e-6)
 
 
-def test_ceiling_follows_stock_by_speed(cc, cs):
-  """The wire never asks for more than stock's own accelerating command at that speed."""
-  assert max(CarControllerParams.ACCEL_CEILING_V) <= CarControllerParams.ACCEL_MAX
-  for v_ego, ceiling in ((4., 1.75), (14., 1.05), (25., 0.65), (35., 0.65)):
+def test_ceiling_by_speed(cc, cs):
+  """In town the wire may ask for the panda's 2.0; from 14 m/s never more than stock's own
+  accelerating command at that speed."""
+  top = CarControllerParams.ACCEL_MAX
+  for v_ego, ceiling in ((4., top), (11., top), (12.5, (top + 0.95) / 2), (14., 0.95), (25., 0.65), (35., 0.65)):
     cc.accel_last = 2.0
     for _ in range(seconds(1.0)):  # settles through the lift limit
       step_long(cc, cs, accel=2.0, cruise_engaged=True, v_ego=v_ego)
@@ -253,7 +256,7 @@ def test_accel_last_tracks_the_wire_not_the_plan(cc, cs):
   assert cc.accel_last == pytest.approx(CarControllerParams.ACCEL_MIN, rel=1e-6, abs=1e-12)
   row = long_frames(sends)
   if row is not None:
-    assert row[0] == round(cc.accel_last * 1000)
+    assert row[0] == round(cc.accel_last * 1024)
 
   # the standstill hold is the plan's own command, and that is what gets reported
   for _ in range(seconds(0.5)):
@@ -294,7 +297,7 @@ def test_release_command_holds_through_the_debounce_then_jumps(cc, cs):
 
   debounce = [r for r in rows if r[1]]
   assert debounce, "no stop-bit frames through the release debounce"
-  assert all(cmd == -1300 for cmd, _, _ in debounce), \
+  assert all(cmd == round(-1.3 * 1024) for cmd, _, _ in debounce), \
     f"command moved off the hold while STOPPING was asserted: {sorted({c for c, _, _ in debounce})}"
 
   # Never-latched releases do not send an unlatch pulse.
@@ -319,9 +322,9 @@ def test_release_keeps_climbing_until_the_car_actually_moves(cc, cs):
   """Continue the bounded release ramp while stopped because Mazda longitudinal has no integrator."""
   lead = dict(lead_visible=True, lead_d_rel=2.5, lead_v_rel=0.0)
   for _ in range(seconds(0.5)):
-    step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=False, **lead)
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=False, **lead)
   for _ in range(seconds(2.0)):
-    step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True, **lead)
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True, **lead)
 
   # Keep the simulated car stopped under a plan command below breakaway authority.
   peak = -10.
@@ -350,7 +353,7 @@ def test_breakaway_is_bounded_relative_to_the_plan(cc, cs, plan, cap):
   """Bound breakaway by both stock authority and the plan-relative margin."""
   lead = dict(lead_visible=True, lead_d_rel=3.9, lead_v_rel=0.2)
   for _ in range(seconds(2.0)):
-    step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True, **lead)
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True, **lead)
   peak = -10.
   for _ in range(seconds(2.5)):
     step_long(cc, cs, accel=plan, standstill=True, **lead)
@@ -364,7 +367,7 @@ def test_breakaway_ceiling_lowered_by_the_plan_is_walked_down_not_stepped(cc, cs
   # the ramp is at +1.2 on a plan of +0.6 when the lead stops again and the plan drops to
   # +0.1: the ceiling falls under the ramp, and the command follows at the winddown limit
   for _ in range(seconds(2.0)):
-    step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True)
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True)
   for _ in range(seconds(1.5)):
     step_long(cc, cs, accel=0.6, standstill=True)
   assert cc.accel_last > 1.0
@@ -398,10 +401,26 @@ def test_breakaway_gives_up_so_a_stuck_car_is_not_leaned_on(cc, cs):
   # something we cannot see is holding the car (kerb, grade). Asking forever is worse than
   # settling back onto the plan, which the driver can then override with the pedal.
   for _ in range(seconds(2.0)):
-    step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True)
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True)
   for _ in range(BREAKAWAY_FRAMES + seconds(1.0)):
     step_long(cc, cs, accel=0.3, standstill=True)
   assert cc.accel_last == pytest.approx(0.3, abs=0.01), f"still leaning on a car that never moved: {cc.accel_last:.2f}"
+
+
+def test_breakaway_ramp_is_quick_only_while_stopped(cc, cs):
+  """Past stock's release frames the climb quickens while the car is still stopped; once it
+  rolls, the ramp to the plan is stock's again."""
+  for _ in range(seconds(2.0)):
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True)
+  for _ in range(RELEASE_DEBOUNCE_FRAMES + RELEASE_SHAPE_FRAMES + seconds(0.1)):
+    step_long(cc, cs, accel=1.4, standstill=True)
+  prev = cc.accel_last
+  step_long(cc, cs, accel=1.4, standstill=True)
+  assert cc.accel_last - prev == pytest.approx(CarControllerParams.ACCEL_BREAKAWAY_RAMP * DT_CTRL, abs=1e-6)
+  step_long(cc, cs, accel=1.4, standstill=False)  # carries the last stopped frame's step
+  prev = cc.accel_last
+  step_long(cc, cs, accel=1.4, standstill=False)
+  assert cc.accel_last - prev == pytest.approx(CarControllerParams.ACCEL_RELEASE_RAMP * DT_CTRL, abs=1e-6)
 
 
 def test_breakaway_never_climbs_against_a_latched_body(cc, cs):
@@ -420,14 +439,14 @@ def test_never_latched_release_speaks_the_stock_wire_grammar(cc, cs):
   """Slewing off the hold value under a long pulse put hold-grade braking beneath
   RESUME_UNLATCHING, a (stop, unlatch, cmd) tuple stock never emits (route 00000053 t+714.8).
   Stock's never-latched grammar (33-pulse census): the command relax-jumps into the
-  -0.27..-0.11 band in one frame and the ramp climbs ~+25 raw per wire frame. Stock also blips
-  RESUME_UNLATCHING here; we do not, since nothing is latched, so the blip assertions are
-  replaced by requiring no unlatch bit at all."""
+  -0.27..-0.11 band in one frame and the ramp climbs ~+25 raw per wire frame through the
+  release frames. Stock also blips RESUME_UNLATCHING here; we do not, since nothing is latched,
+  so the blip assertions are replaced by requiring no unlatch bit at all."""
   for _ in range(seconds(0.5)):
     step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=False, **LEAD_4M)
   for _ in range(seconds(2.0)):
-    step_long(cc, cs, long_state=STOPPING, accel=-1.024, standstill=True, **LEAD_4M)
-  assert cc.accel_last == pytest.approx(-1.024, rel=1e-6, abs=1e-12)
+    step_long(cc, cs, long_state=STOPPING, accel=-1.0, standstill=True, **LEAD_4M)
+  assert cc.accel_last == pytest.approx(-1.0, rel=1e-6, abs=1e-12)
 
   rows = crz_info_rows(cc, cs, seconds(1.5), accel=0.45, standstill=True, **LEAD_4M)
 
@@ -438,8 +457,8 @@ def test_never_latched_release_speaks_the_stock_wire_grammar(cc, cs):
   assert all(cmd >= -280 for cmd, _, _ in post), f"command stayed at hold depth after the drop: {min(c for c, _, _ in post)}"
   assert post[0][0] <= -180, f"release did not start inside the stock band: {post[0][0]}"
   assert not any(unl for _, _, unl in rows), "a never-latched release pulsed"
-  # Match stock's 25-count-per-wire-frame release ramp.
-  ramping = [c for c, _, _ in post][:20]
+  # Match stock's 25-count-per-wire-frame release ramp through its release frames.
+  ramping = [c for c, _, _ in post][:RELEASE_SHAPE_FRAMES // CarControllerParams.LONG_STEP]
   assert all(20 <= b - a <= 30 for a, b in zip(ramping, ramping[1:], strict=False)), f"off the stock ramp: {ramping}"
 
 

@@ -20,8 +20,6 @@
 // applies steering torque, and the cluster chimes for as long as it stays set.
 #define MAZDA_CRZ_CTRL_STEER_CHIME_BYTE 4U
 #define MAZDA_CRZ_CTRL_STEER_CHIME_MASK 0x80U
-// Camera frames the relay may copy: openpilot runs a frame or two behind the camera.
-#define MAZDA_CAM_CRZ_CTRL_HISTORY 2U
 // CAM_TRAFFIC_SIGNS draws the speed limit sign on the HUD. SPEED_SIGN is DBC bits 4..0 of byte 0
 // and 7..6 of byte 1, SPEED_SIGN_UNIT bits 5..4 of byte 1 (2 = km/h).
 #define MAZDA_TRAFFIC_SIGNS 0x35fU
@@ -67,25 +65,6 @@
 // Both PEDALS cruise bits low for this many samples is a main-off: values'
 // MAIN_OFF_DEBOUNCE_SAMPLES, which carstate counts the same way.
 #define MAZDA_MAIN_OFF_DEBOUNCE 10U
-
-static bool mazda_longitudinal = false;
-// Declared by the driver: the TJA button owns lateral and MRCC no longer drives the main edge.
-static bool mazda_tja_button = false;
-// Declared by the platform, not the driver: the car has no MRCC module at all.
-static bool mazda_non_mrcc = false;
-static bool mazda_eps_hw = false;
-// Live cruise arming from PEDALS, both longitudinal modes (carstate mrcc_armed_raw).
-static bool mazda_acc_armed = false;
-static uint32_t mazda_engage_btn_frames = 0U;
-static uint8_t mazda_cam_crz_ctrl[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
-static uint32_t mazda_cam_crz_ctrl_seen = 0U;
-static uint8_t mazda_cam_tsr[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
-static uint32_t mazda_cam_tsr_seen = 0U;
-static uint8_t mazda_auto_hold_btn[MAZDA_CAM_CRZ_CTRL_HISTORY][8];
-static uint32_t mazda_auto_hold_btn_seen = 0U;
-// Unknown counts as armed: a press on an armed Auto Hold switches it off.
-static bool mazda_auto_hold_armed = true;
-static uint32_t mazda_main_off_samples = 0U;
 
 static bool mazda_mrcc_off_msg_valid(const CANPacket_t *msg) {
   // Exact active-low MRCC master tap. CTR occupies the variable bits in byte 3;
@@ -135,135 +114,132 @@ static bool mazda_radar_capture_msg_valid(const CANPacket_t *msg) {
 
 // track msgs coming from OP so that we know what CAM msgs to drop and what to forward
 static void mazda_rx_hook(const CANPacket_t *msg) {
-  if ((int)msg->bus == MAZDA_MAIN) {
-    if (msg->addr == MAZDA_ENGINE_DATA) {
-      // sample speed: scale by 0.01 to get kph
-      int speed = (msg->data[2] << 8) | msg->data[3];
-      vehicle_moving = speed > 10; // moving when speed > 0.1 kph
-    }
+  if (msg_matches(msg, MAZDA_ENGINE_DATA, MAZDA_MAIN)) {
+    // sample speed: scale by 0.01 to get kph
+    int speed = (msg->data[2] << 8) | msg->data[3];
+    safety.vehicle_moving = speed > 10;  // moving when speed > 0.1 kph
+  }
 
-    if (msg->addr == MAZDA_STEER_TORQUE) {
-      int torque_driver_new = msg->data[0] - 127U;
-      // update array of samples
-      update_sample(&torque_driver, torque_driver_new);
-    }
+  if (msg_matches(msg, MAZDA_STEER_TORQUE, MAZDA_MAIN)) {
+    int torque_driver_new = msg->data[0] - 127U;
+    // update array of samples
+    update_sample(&safety.torque_driver, torque_driver_new);
+  }
 
-    // enter controls on rising edge of ACC, exit controls on ACC off
-    if ((msg->addr == MAZDA_CRZ_CTRL) && !mazda_longitudinal) {
-      bool cruise_engaged = msg->data[0] & 0x8U;
-      pcm_cruise_check(cruise_engaged);
-      // With the TJA button owning lateral, MRCC no longer drives the MADS main edge: its
-      // falling edge would exit the panda's lateral while the software's MADS stays on.
-      if (!mazda_tja_button) {
-        acc_main_on = GET_BIT(msg, 17U);
-      }
+  // enter controls on rising edge of ACC, exit controls on ACC off
+  if (msg_matches(msg, MAZDA_CRZ_CTRL, MAZDA_MAIN) && !safety_setup.mazda_longitudinal) {
+    bool cruise_engaged = msg->data[0] & 0x8U;
+    pcm_cruise_check(cruise_engaged);
+    // With the TJA button owning lateral, MRCC no longer drives the MADS main edge: its
+    // falling edge would exit the panda's lateral while the software's MADS stays on.
+    if (!safety_setup.mazda_tja_button) {
+      safety.acc_main_on = GET_BIT(msg, 17U);
     }
+  }
 
-    if (msg->addr == MAZDA_CRZ_BTNS) {
-      // TJA-declared cars keep their own lateral switch. Otherwise ON rearms lateral in standby,
-      // since a main that stayed on through boot can expire before selfdrived is ready.
-      bool lateral_button = mazda_tja_button ? GET_BIT(msg, MAZDA_TJA_BUTTON_BIT) : (acc_main_on && GET_BIT(msg, MAZDA_MODE_Y_BIT));
-      mads_button_press = lateral_button ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
+  if (msg_matches(msg, MAZDA_CRZ_BTNS, MAZDA_MAIN)) {
+    // TJA-declared cars keep their own lateral switch. Otherwise ON rearms lateral in standby,
+    // since a main that stayed on through boot can expire before selfdrived is ready.
+    bool lateral_button = safety_setup.mazda_tja_button ? GET_BIT(msg, MAZDA_TJA_BUTTON_BIT) : (safety.acc_main_on && GET_BIT(msg, MAZDA_MODE_Y_BIT));
+    safety.mads_button_press = lateral_button ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
+  }
+
+  if (msg_matches(msg, MAZDA_CRZ_BTNS, MAZDA_MAIN) && safety_setup.mazda_non_mrcc) {
+    // No TJA button on this trim, and no MRCC for the MODE button to switch: it owns lateral.
+    safety.mads_button_press = GET_BIT(msg, MAZDA_MODE_Y_BIT) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
+  }
+
+  if (msg_matches(msg, MAZDA_CRZ_BTNS, MAZDA_MAIN) && safety_setup.mazda_longitudinal) {
+    // A physical cancel press always exits controls.
+    if (GET_BIT(msg, 0U)) {
+      safety.controls_allowed = false;
     }
-
-    if ((msg->addr == MAZDA_CRZ_BTNS) && mazda_non_mrcc) {
-      // No TJA button on this trim, and no MRCC for the MODE button to switch: it owns lateral.
-      mads_button_press = GET_BIT(msg, MAZDA_MODE_Y_BIT) ? MADS_BUTTON_PRESSED : MADS_BUTTON_NOT_PRESSED;
+    // Record SET/RES intent for the engagement qualifier below.
+    if (GET_BIT(msg, 2U) || GET_BIT(msg, 4U) || GET_BIT(msg, 5U)) {
+      safety.mazda_engage_btn_frames = MAZDA_ENGAGE_BTN_WINDOW;
+    } else if (safety.mazda_engage_btn_frames > 0U) {
+      safety.mazda_engage_btn_frames -= 1U;
+    } else {
     }
+  }
 
-    if ((msg->addr == MAZDA_CRZ_BTNS) && mazda_longitudinal) {
-      // A physical cancel press always exits controls.
-      if (GET_BIT(msg, 0U)) {
-        controls_allowed = false;
-      }
-      // Record SET/RES intent for the engagement qualifier below.
-      if (GET_BIT(msg, 2U) || GET_BIT(msg, 4U) || GET_BIT(msg, 5U)) {
-        mazda_engage_btn_frames = MAZDA_ENGAGE_BTN_WINDOW;
-      } else if (mazda_engage_btn_frames > 0U) {
-        mazda_engage_btn_frames -= 1U;
+  if (msg_matches(msg, MAZDA_ENGINE_DATA, MAZDA_MAIN)) {
+    safety.gas_pressed = (msg->data[4] | (msg->data[5] & 0xF0U)) != 0U;
+  }
+
+  if (msg_matches(msg, MAZDA_PEDALS, MAZDA_MAIN)) {
+    safety.brake_pressed = (msg->data[0] & 0x10U);
+    // The live MRCC arm from the body's own PEDALS bits, the sample mrcc_armed_raw reads, so the
+    // MRCC-off exception opens on the frame the controller first sends (CRZ_CTRL lags it).
+    safety.mazda_acc_armed = GET_BIT(msg, 2U) || GET_BIT(msg, 3U);
+    if (safety_setup.mazda_longitudinal) {
+      // Derive cruise state from PEDALS after radar teardown.
+      bool cruise_engaged = GET_BIT(msg, 3U);
+      bool brake_free = !safety.brake_pressed && !safety.brake_pressed_prev;
+
+      // Main mirrors carstate's cruise_available sample for sample: a main that falls on one side
+      // only steers MADS into rejected frames (docs/zoompilot/mazda-longitudinal.md).
+      if (safety_setup.mazda_tja_button) {
+        // the button is the lateral switch; MRCC is cruise only
+      } else if (safety.mazda_acc_armed) {
+        // The radar takeover gates cruise (controls_allowed below), never main.
+        safety.acc_main_on = true;
+        safety.mazda_main_off_samples = 0U;
       } else {
-      }
-    }
-
-    if (msg->addr == MAZDA_ENGINE_DATA) {
-      gas_pressed = (msg->data[4] || (msg->data[5] & 0xF0U));
-    }
-
-    if (msg->addr == MAZDA_PEDALS) {
-      bool brake = (msg->data[0] & 0x10U);
-      // The live MRCC arm from the body's own PEDALS bits, the sample mrcc_armed_raw reads, so the
-      // MRCC-off exception opens on the frame the controller first sends (CRZ_CTRL lags it).
-      mazda_acc_armed = GET_BIT(msg, 2U) || GET_BIT(msg, 3U);
-      if (mazda_longitudinal) {
-        // Derive cruise state from PEDALS after radar teardown.
-        bool cruise_engaged = GET_BIT(msg, 3U);
-        bool brake_free = !brake && !brake_pressed_prev;
-
-        // Main mirrors carstate's cruise_available sample for sample: a main that falls on one side
-        // only steers MADS into rejected frames (docs/zoompilot/mazda-longitudinal.md).
-        if (mazda_tja_button) {
-          // the button is the lateral switch; MRCC is cruise only
-        } else if (mazda_acc_armed) {
-          // The radar takeover gates cruise (controls_allowed below), never main.
-          acc_main_on = true;
-          mazda_main_off_samples = 0U;
-        } else {
-          if (mazda_main_off_samples < MAZDA_MAIN_OFF_DEBOUNCE) {
-            mazda_main_off_samples += 1U;
-          }
-          if (mazda_main_off_samples >= MAZDA_MAIN_OFF_DEBOUNCE) {
-            acc_main_on = false;
-          }
+        if (safety.mazda_main_off_samples < MAZDA_MAIN_OFF_DEBOUNCE) {
+          safety.mazda_main_off_samples += 1U;
         }
-
-        if (mazda_acc_armed || cruise_engaged_prev || brake_free) {
-          // Require recent SET/RES intent on the engaged edge; ACC_ACTIVE alone may acknowledge
-          // synthetic traffic rather than a driver request.
-          if (cruise_engaged && !cruise_engaged_prev && (mazda_engage_btn_frames > 0U)) {
-            controls_allowed = true;
-          }
-          if (!cruise_engaged) {
-            controls_allowed = false;
-          }
-          cruise_engaged_prev = cruise_engaged;
+        if (safety.mazda_main_off_samples >= MAZDA_MAIN_OFF_DEBOUNCE) {
+          safety.acc_main_on = false;
         }
       }
-      brake_pressed = brake;
+
+      if (safety.mazda_acc_armed || safety.cruise_engaged_prev || brake_free) {
+        // Require recent SET/RES intent on the engaged edge; ACC_ACTIVE alone may acknowledge
+        // synthetic traffic rather than a driver request.
+        if (cruise_engaged && !safety.cruise_engaged_prev && (safety.mazda_engage_btn_frames > 0U)) {
+          safety.controls_allowed = true;
+        }
+        if (!cruise_engaged) {
+          safety.controls_allowed = false;
+        }
+        safety.cruise_engaged_prev = cruise_engaged;
+      }
     }
   }
 
-  if (((int)msg->bus == MAZDA_CAM) && (msg->addr == MAZDA_CRZ_CTRL) && mazda_non_mrcc) {
+  if (msg_matches(msg, MAZDA_CRZ_CTRL, MAZDA_CAM) && safety_setup.mazda_non_mrcc) {
     for (uint32_t i = 0U; i < 8U; i++) {
-      mazda_cam_crz_ctrl[1][i] = mazda_cam_crz_ctrl[0][i];
-      mazda_cam_crz_ctrl[0][i] = msg->data[i];
+      safety.mazda_cam_crz_ctrl[1][i] = safety.mazda_cam_crz_ctrl[0][i];
+      safety.mazda_cam_crz_ctrl[0][i] = msg->data[i];
     }
-    if (mazda_cam_crz_ctrl_seen < MAZDA_CAM_CRZ_CTRL_HISTORY) {
-      mazda_cam_crz_ctrl_seen += 1U;
+    if (safety.mazda_cam_crz_ctrl_seen < MAZDA_CAM_FRAME_HISTORY) {
+      safety.mazda_cam_crz_ctrl_seen += 1U;
     }
   }
 
-  if (((int)msg->bus == MAZDA_CAM) && (msg->addr == MAZDA_TRAFFIC_SIGNS) && mazda_non_mrcc) {
+  if (msg_matches(msg, MAZDA_TRAFFIC_SIGNS, MAZDA_CAM) && safety_setup.mazda_non_mrcc) {
     for (uint32_t i = 0U; i < 8U; i++) {
-      mazda_cam_tsr[1][i] = mazda_cam_tsr[0][i];
-      mazda_cam_tsr[0][i] = msg->data[i];
+      safety.mazda_cam_tsr[1][i] = safety.mazda_cam_tsr[0][i];
+      safety.mazda_cam_tsr[0][i] = msg->data[i];
     }
-    if (mazda_cam_tsr_seen < MAZDA_CAM_CRZ_CTRL_HISTORY) {
-      mazda_cam_tsr_seen += 1U;
+    if (safety.mazda_cam_tsr_seen < MAZDA_CAM_FRAME_HISTORY) {
+      safety.mazda_cam_tsr_seen += 1U;
     }
   }
 
-  if (((int)msg->bus == MAZDA_MAIN) && (msg->addr == MAZDA_AUTO_HOLD_BTN) && mazda_non_mrcc) {
+  if (msg_matches(msg, MAZDA_AUTO_HOLD_BTN, MAZDA_MAIN) && safety_setup.mazda_non_mrcc) {
     for (uint32_t i = 0U; i < 8U; i++) {
-      mazda_auto_hold_btn[1][i] = mazda_auto_hold_btn[0][i];
-      mazda_auto_hold_btn[0][i] = msg->data[i];
+      safety.mazda_auto_hold_btn[1][i] = safety.mazda_auto_hold_btn[0][i];
+      safety.mazda_auto_hold_btn[0][i] = msg->data[i];
     }
-    if (mazda_auto_hold_btn_seen < MAZDA_CAM_CRZ_CTRL_HISTORY) {
-      mazda_auto_hold_btn_seen += 1U;
+    if (safety.mazda_auto_hold_btn_seen < MAZDA_CAM_FRAME_HISTORY) {
+      safety.mazda_auto_hold_btn_seen += 1U;
     }
   }
 
-  if (((int)msg->bus == MAZDA_MAIN) && (msg->addr == MAZDA_EPB) && mazda_non_mrcc) {
-    mazda_auto_hold_armed = (msg->data[MAZDA_EPB_AUTO_HOLD_ARMED_BYTE] & MAZDA_EPB_AUTO_HOLD_ARMED_MASK) != 0U;
+  if (msg_matches(msg, MAZDA_EPB, MAZDA_MAIN) && safety_setup.mazda_non_mrcc) {
+    safety.mazda_auto_hold_armed = (msg->data[MAZDA_EPB_AUTO_HOLD_ARMED_BYTE] & MAZDA_EPB_AUTO_HOLD_ARMED_MASK) != 0U;
   }
 }
 
@@ -276,18 +252,19 @@ static bool mazda_tsr_relay_valid(const CANPacket_t *msg) {
   uint32_t unit = ((uint32_t)msg->data[1] >> 4U) & 0x3U;
   bool plausible = (unit == MAZDA_TSR_UNIT_KPH) && (speed >= MAZDA_TSR_MIN_KPH) && (speed <= MAZDA_TSR_MAX_KPH);
 
-  for (uint32_t f = 0U; f < mazda_cam_tsr_seen; f++) {
-    bool rest_same = ((msg->data[0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK)) == (mazda_cam_tsr[f][0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK))) &&
-                     ((msg->data[1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)) == (mazda_cam_tsr[f][1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)));
+  for (uint32_t f = 0U; f < safety.mazda_cam_tsr_seen; f++) {
+    const uint8_t *cam = safety.mazda_cam_tsr[f];
+    bool rest_same = ((msg->data[0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK)) == (cam[0] & (uint8_t)(~MAZDA_TSR_BYTE0_SIGN_MASK))) &&
+                     ((msg->data[1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)) == (cam[1] & (uint8_t)(~MAZDA_TSR_BYTE1_SIGN_MASK)));
     for (uint32_t i = 2U; i < 8U; i++) {
       uint8_t mask = (i == MAZDA_TSR_SHOWN_BYTE) ? (uint8_t)(~MAZDA_TSR_SHOWN_MASK) : 0xffU;
-      if ((msg->data[i] & mask) != (mazda_cam_tsr[f][i] & mask)) {
+      if ((msg->data[i] & mask) != (cam[i] & mask)) {
         rest_same = false;
       }
     }
-    bool sign_same = ((msg->data[0] & MAZDA_TSR_BYTE0_SIGN_MASK) == (mazda_cam_tsr[f][0] & MAZDA_TSR_BYTE0_SIGN_MASK)) &&
-                     ((msg->data[1] & MAZDA_TSR_BYTE1_SIGN_MASK) == (mazda_cam_tsr[f][1] & MAZDA_TSR_BYTE1_SIGN_MASK)) &&
-                     ((msg->data[MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK) == (mazda_cam_tsr[f][MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK));
+    bool sign_same = ((msg->data[0] & MAZDA_TSR_BYTE0_SIGN_MASK) == (cam[0] & MAZDA_TSR_BYTE0_SIGN_MASK)) &&
+                     ((msg->data[1] & MAZDA_TSR_BYTE1_SIGN_MASK) == (cam[1] & MAZDA_TSR_BYTE1_SIGN_MASK)) &&
+                     ((msg->data[MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK) == (cam[MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK));
     bool map_limit = plausible && ((msg->data[MAZDA_TSR_SHOWN_BYTE] & MAZDA_TSR_SHOWN_MASK) == MAZDA_TSR_SHOWN_MASK);
     valid = valid || (rest_same && (sign_same || map_limit));
   }
@@ -301,11 +278,11 @@ static bool mazda_crz_ctrl_relay_valid(const CANPacket_t *msg) {
   bool valid = false;
 
   if ((msg->data[MAZDA_CRZ_CTRL_STEER_CHIME_BYTE] & MAZDA_CRZ_CTRL_STEER_CHIME_MASK) == 0U) {
-    for (uint32_t f = 0U; f < mazda_cam_crz_ctrl_seen; f++) {
+    for (uint32_t f = 0U; f < safety.mazda_cam_crz_ctrl_seen; f++) {
       bool same = true;
       for (uint32_t i = 0U; i < 8U; i++) {
         uint8_t mask = (i == MAZDA_CRZ_CTRL_STEER_CHIME_BYTE) ? (uint8_t)(~MAZDA_CRZ_CTRL_STEER_CHIME_MASK) : 0xffU;
-        if ((msg->data[i] & mask) != (mazda_cam_crz_ctrl[f][i] & mask)) {
+        if ((msg->data[i] & mask) != (safety.mazda_cam_crz_ctrl[f][i] & mask)) {
           same = false;
         }
       }
@@ -321,8 +298,8 @@ static bool mazda_crz_ctrl_relay_valid(const CANPacket_t *msg) {
 static bool mazda_auto_hold_press_valid(const CANPacket_t *msg) {
   bool valid = false;
 
-  for (uint32_t f = 0U; f < mazda_auto_hold_btn_seen; f++) {
-    const uint8_t *car = mazda_auto_hold_btn[f];
+  for (uint32_t f = 0U; f < safety.mazda_auto_hold_btn_seen; f++) {
+    const uint8_t *car = safety.mazda_auto_hold_btn[f];
     uint8_t ctr = (uint8_t)((((uint32_t)car[4] >> 4U) + 1U) & 0xFU);
     uint8_t chk = (ctr == 0U) ? (uint8_t)((uint32_t)car[5] + 14U) : (uint8_t)((uint32_t)car[5] - 2U);
     bool released = (car[MAZDA_AUTO_HOLD_BTN_BYTE] & MAZDA_AUTO_HOLD_BTN_MASK) == 0U;
@@ -345,11 +322,10 @@ static bool mazda_is_lka_addr(int addr) {
 // axis under MADS (controls_allowed_lateral); with MADS off it follows cruise. Cruise alone must
 // not claim them, or it silences the camera's own TJA/CTS while the dash shows nothing.
 static bool mazda_openpilot_controlling(void) {
-  return controls_allowed_lateral || (controls_allowed && !m_mads_state.system_enabled);
+  return safety.controls_allowed_lateral || (safety.controls_allowed && !safety.m_mads_state.system_enabled);
 }
 
 static bool mazda_tx_hook(const CANPacket_t *msg) {
-  // Upstream's envelope, the no-param default.
   const TorqueSteeringLimits MAZDA_STEERING_LIMITS = {
     .max_torque = 800,
     .max_rate_up = 10,
@@ -360,34 +336,36 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     .type = TorqueDriverLimited,
   };
 
-  // The measured EPS envelope: the EPS's 12-count hardware slew, with max_rate_down equal to the
-  // controller retreat rate so driver-limit winddown frames remain valid.
+  // The measured EPS envelope, which MAZDA_PARAM_EPS_HW selects over the one above: the EPS's ~1000 counts/s hardware slew (12 counts per 12 ms 0x241
+  // frame) at 100 Hz, with max_rate_down equal to the controller retreat rate so driver-limit
+  // winddown frames remain valid.
   const TorqueSteeringLimits MAZDA_EPS_HW_STEERING_LIMITS = {
     .max_torque = 1200,
-    .max_rate_up = 12,
-    .max_rate_down = 12,
-    .max_rt_delta = 384,
+    .max_rate_up = 10,
+    .max_rate_down = 10,
+    .max_rt_delta = 320,
     .driver_torque_multiplier = 15,
     .driver_torque_allowance = 15,
     .type = TorqueDriverLimited,
   };
 
-  // CRZ_INFO.ACCEL_CMD uses 0.001 m/s2 raw units after removing the offset.
+  // CRZ_INFO.ACCEL_CMD uses 1/1024 m/s2 raw units after removing the offset: 2.0 and -3.5 m/s2.
   const LongitudinalLimits MAZDA_LONG_LIMITS = {
-    .max_accel = 2000,
-    .min_accel = -3500,
+    .max_accel = 2048,
+    .min_accel = -3584,
     .inactive_accel = 0,
   };
 
   bool tx = true;
-  bool main_bus = msg->bus == (unsigned char)MAZDA_MAIN;
-  bool long_replacement_bus = main_bus || (msg->bus == (unsigned char)MAZDA_CAM);
-
-  if (main_bus && (msg->addr == MAZDA_LKAS)) {
+  // longitudinal replaces the radar's frames on both sides of the harness
+  bool long_replacement_bus = (msg->bus == (unsigned char)MAZDA_MAIN) || (msg->bus == (unsigned char)MAZDA_CAM);
+  // Check if msg is sent on the main BUS
+  // steer cmd checks
+  if (msg_matches(msg, MAZDA_LKAS, MAZDA_MAIN)) {
     int desired_torque = (((msg->data[0] & 0x0FU) << 8) | msg->data[1]) - 2048U;
 
     const TorqueSteeringLimits *limits = &MAZDA_STEERING_LIMITS;
-    if (mazda_eps_hw) {
+    if (safety_setup.mazda_eps_hw) {
       limits = &MAZDA_EPS_HW_STEERING_LIMITS;
     }
     if (steer_torque_cmd_checks(desired_torque, -1, *limits)) {
@@ -396,32 +374,32 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
   }
 
   // Run after steering checks, which reset rate-limit state while disengaged.
-  if (main_bus && mazda_is_lka_addr(msg->addr) && !mazda_openpilot_controlling()) {
+  if ((msg_matches(msg, MAZDA_LKAS, MAZDA_MAIN) || msg_matches(msg, MAZDA_LKAS_HUD, MAZDA_MAIN)) && !mazda_openpilot_controlling()) {
     tx = false;
   }
 
-  if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_TRAFFIC_SIGNS)) {
+  if (safety_setup.mazda_non_mrcc && msg_matches(msg, MAZDA_TRAFFIC_SIGNS, MAZDA_MAIN)) {
     // Stands in for the camera's frame only while that frame is blocked below.
     if (!mazda_openpilot_controlling() || !mazda_tsr_relay_valid(msg)) {
       tx = false;
     }
   }
 
-  if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_CRZ_CTRL)) {
+  if (safety_setup.mazda_non_mrcc && msg_matches(msg, MAZDA_CRZ_CTRL, MAZDA_MAIN)) {
     // Stands in for the camera's frame only while that frame is blocked below.
     if (!mazda_openpilot_controlling() || !mazda_crz_ctrl_relay_valid(msg)) {
       tx = false;
     }
   }
 
-  if (mazda_non_mrcc && main_bus && (msg->addr == MAZDA_AUTO_HOLD_BTN)) {
+  if (safety_setup.mazda_non_mrcc && msg_matches(msg, MAZDA_AUTO_HOLD_BTN, MAZDA_MAIN)) {
     // Stopped with the brake held and Auto Hold off only: pressed while armed it switches off.
-    if (vehicle_moving || !brake_pressed || mazda_auto_hold_armed || !mazda_auto_hold_press_valid(msg)) {
+    if (safety.vehicle_moving || !safety.brake_pressed || safety.mazda_auto_hold_armed || !mazda_auto_hold_press_valid(msg)) {
       tx = false;
     }
   }
 
-  if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
+  if (safety_setup.mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_INFO)) {
     // Allow byte-exact stock standby patterns with the raw 8190 command sentinel.
     bool stock_standby = (msg->data[0] == 0x01U) && (msg->data[1] == 0xffU) &&
                          (msg->data[2] == 0xe3U) && (msg->data[3] == 0xffU) &&
@@ -440,26 +418,26 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
 
     // ACC_ACTIVE requires prior controls permission established from the physical SET edge.
     bool acc_active = GET_BIT(msg, 33U);
-    if (!controls_allowed && acc_active) {
+    if (!safety.controls_allowed && acc_active) {
       tx = false;
     }
   }
 
-  if (mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_CTRL)) {
+  if (safety_setup.mazda_longitudinal && long_replacement_bus && (msg->addr == MAZDA_CRZ_CTRL)) {
     bool cruise_active = GET_BIT(msg, 3U);
-    if (!controls_allowed && cruise_active) {
+    if (!safety.controls_allowed && cruise_active) {
       tx = false;
     }
   }
 
   bool radar_frame = (msg->addr == MAZDA_RADAR_STATIC) || ((msg->addr >= MAZDA_RADAR_TRACK_1) && (msg->addr <= MAZDA_RADAR_TRACK_6));
-  if (mazda_longitudinal && long_replacement_bus && radar_frame) {
+  if (safety_setup.mazda_longitudinal && long_replacement_bus && radar_frame) {
     if (!mazda_radar_capture_msg_valid(msg)) {
       tx = false;
     }
   }
 
-  if (mazda_longitudinal && main_bus && (msg->addr == MAZDA_RADAR_UDS)) {
+  if (safety_setup.mazda_longitudinal && msg_matches(msg, MAZDA_RADAR_UDS, MAZDA_MAIN)) {
     // Allow tester-present and default/programming session control only.
     bool tester_present = (msg->data[0] == 0x02U) && (msg->data[1] == 0x3eU) && (msg->data[2] == 0x80U);
     bool session_control = (msg->data[0] == 0x02U) && (msg->data[1] == 0x10U) &&
@@ -469,12 +447,14 @@ static bool mazda_tx_hook(const CANPacket_t *msg) {
     }
   }
 
-  if (main_bus && (msg->addr == MAZDA_CRZ_BTNS)) {
-    // Permit resume only while controlling and cancel only while not controlling.
+  // cruise buttons check
+  if (msg_matches(msg, MAZDA_CRZ_BTNS, MAZDA_MAIN)) {
+    // allow resume spamming while controls allowed, but
+    // only allow cancel while controls not allowed
     bool cancel_cmd = (msg->data[0] == 0x1U);
     const bool mrcc_off_candidate = !GET_BIT(msg, 16U) && GET_BIT(msg, 15U);
-    const bool mrcc_off_cmd = mazda_tja_button && mazda_acc_armed && mazda_mrcc_off_msg_valid(msg);
-    if (!controls_allowed && !cancel_cmd && !mrcc_off_cmd) {
+    const bool mrcc_off_cmd = safety_setup.mazda_tja_button && safety.mazda_acc_armed && mazda_mrcc_off_msg_valid(msg);
+    if (!safety.controls_allowed && !cancel_cmd && !mrcc_off_cmd) {
       tx = false;
     }
     // An MRCC-off-shaped frame is either the exact narrow exception or invalid; it cannot
@@ -499,7 +479,7 @@ static bool mazda_fwd_hook(int bus_num, int addr) {
     if (mazda_is_lka_addr(addr)) {
       block_msg = mazda_openpilot_controlling();
     }
-    if (mazda_non_mrcc && (((unsigned int)addr == MAZDA_CRZ_CTRL) || ((unsigned int)addr == MAZDA_TRAFFIC_SIGNS))) {
+    if (safety_setup.mazda_non_mrcc && (((unsigned int)addr == MAZDA_CRZ_CTRL) || ((unsigned int)addr == MAZDA_TRAFFIC_SIGNS))) {
       block_msg = mazda_openpilot_controlling();
     }
   }
@@ -508,14 +488,6 @@ static bool mazda_fwd_hook(int bus_num, int addr) {
 }
 
 static safety_config mazda_init(uint16_t param) {
-  mazda_engage_btn_frames = 0U;
-  mazda_cam_crz_ctrl_seen = 0U;
-  mazda_cam_tsr_seen = 0U;
-  mazda_auto_hold_btn_seen = 0U;
-  mazda_auto_hold_armed = true;
-  mazda_main_off_samples = 0U;
-  mazda_acc_armed = false;
-
   static const CanMsg MAZDA_TX_MSGS[] = {
     {MAZDA_LKAS, 0, 8, .check_relay = true, .disable_static_blocking = true},
     {MAZDA_CRZ_BTNS, 0, 8, .check_relay = false},
@@ -561,7 +533,7 @@ static safety_config mazda_init(uint16_t param) {
     {MAZDA_RADAR_TRACK_6, MAZDA_CAM, 8, .check_relay = false},
   };
 
-  static RxCheck mazda_rx_checks[] = {
+  static const RxCheck mazda_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_CTRL,     0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -570,7 +542,7 @@ static safety_config mazda_init(uint16_t param) {
   };
 
   // CRZ_CTRL intentionally disappears after radar teardown.
-  static RxCheck mazda_long_rx_checks[] = {
+  static const RxCheck mazda_long_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -579,7 +551,7 @@ static safety_config mazda_init(uint16_t param) {
 
   // The camera's CRZ_CTRL and the car's Auto Hold frames are checked so the rx hook sees the
   // frames the relays copy and the armed state the press depends on.
-  static RxCheck mazda_non_mrcc_rx_checks[] = {
+  static const RxCheck mazda_non_mrcc_rx_checks[] = {
     {.msg = {{MAZDA_CRZ_BTNS,     0, 8, 10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_STEER_TORQUE, 0, 8, 83U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
     {.msg = {{MAZDA_ENGINE_DATA,  0, 8, 100U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
@@ -590,17 +562,17 @@ static safety_config mazda_init(uint16_t param) {
     {.msg = {{MAZDA_EPB, 0, 8, 50U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},
   };
 
-  mazda_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
-  mazda_eps_hw = GET_FLAG(param, MAZDA_PARAM_EPS_HW);
-  mazda_tja_button = GET_FLAG(current_safety_param_sp, MAZDA_PARAM_SP_TJA_BUTTON);
-  mazda_non_mrcc = GET_FLAG(current_safety_param_sp, MAZDA_PARAM_SP_NON_MRCC);
-  acc_main_on = false;
+  safety_setup.mazda_longitudinal = GET_FLAG(param, MAZDA_PARAM_LONGITUDINAL);
+  safety_setup.mazda_eps_hw = GET_FLAG(param, MAZDA_PARAM_EPS_HW);
+  safety_setup.mazda_tja_button = GET_FLAG(safety_setup.current_safety_param_sp, MAZDA_PARAM_SP_TJA_BUTTON);
+  safety_setup.mazda_non_mrcc = GET_FLAG(safety_setup.current_safety_param_sp, MAZDA_PARAM_SP_NON_MRCC);
+  safety.mazda_auto_hold_armed = true;
 
   // A car with no MRCC never publishes CRZ_CTRL on the main bus past the first seconds, so it
   // checks the camera's instead, without opening the longitudinal TX list.
-  return mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_LONG_TX_MSGS) :
-         mazda_non_mrcc     ? BUILD_SAFETY_CFG(mazda_non_mrcc_rx_checks, MAZDA_NON_MRCC_TX_MSGS) :
-                              BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
+  return safety_setup.mazda_longitudinal ? BUILD_SAFETY_CFG(mazda_long_rx_checks, MAZDA_LONG_TX_MSGS) :
+         safety_setup.mazda_non_mrcc     ? BUILD_SAFETY_CFG(mazda_non_mrcc_rx_checks, MAZDA_NON_MRCC_TX_MSGS) :
+                                           BUILD_SAFETY_CFG(mazda_rx_checks, MAZDA_TX_MSGS);
 }
 
 const safety_hooks mazda_hooks = {

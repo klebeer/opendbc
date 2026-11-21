@@ -12,6 +12,12 @@ from opendbc.safety.tests.common import CANPackerSafety, make_msg
 DEBOUNCE = CarControllerParams.MAIN_OFF_DEBOUNCE_SAMPLES
 
 
+def assert_copies_agree(test):
+  """The redundant safety copies ran every hook alike: mode state kept outside them would diverge."""
+  test.assertFalse(test.safety.safety_redundancy_fault)
+  test.assertEqual(common.state_buffer("safety_a")[:], common.state_buffer("safety_b")[:])
+
+
 class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTest):
   """Upstream's envelope with no safety param bit. The interface no longer emits it for any
   Mazda; the panda keeps it as the default, so it stays proven."""
@@ -161,7 +167,7 @@ class TestMazdaSafety(common.CarSafetyTest, common.DriverTorqueSteeringSafetyTes
 
 class TestMazdaEpsSafety(TestMazdaSafety):
   """Every gen1 Mazda EPS, steer-to-zero and legacy firmware alike: MazdaSafetyFlags.EPS_HW selects
-  the 1200-count envelope with the EPS's own 12/12 slew. The numbers are the controller's, so the
+  the 1200-count envelope with the EPS's own 10/10 slew. The numbers are the controller's, so the
   panda is proven against exactly what the car side runs."""
 
   SAFETY_PARAM = MazdaSafetyFlags.EPS_HW
@@ -170,13 +176,13 @@ class TestMazdaEpsSafety(TestMazdaSafety):
   MAX_RATE_DOWN = CarControllerParams.STEER_DELTA_DOWN
   MAX_TORQUE_LOOKUP = [0], [CarControllerParams.EPS_STEER_MAX]
 
-  MAX_RT_DELTA = 384
+  MAX_RT_DELTA = 320
 
   DRIVER_TORQUE_ALLOWANCE = CarControllerParams.STEER_DRIVER_ALLOWANCE
   DRIVER_TORQUE_FACTOR = CarControllerParams.STEER_DRIVER_MULTIPLIER
 
   def test_upstream_envelope_without_the_bit(self):
-    # with it clear upstream's limits refuse the very first frame above 800 and the 12-count ramp.
+    # with it clear upstream's limits refuse the very first frame above 800.
     # 4, the retired legacy-firmware bit, selects nothing: a car side that still sends it alone
     # gets the stricter limits, never looser ones
     for param in (0, 4):
@@ -242,6 +248,18 @@ class TestMazdaLongitudinalSafety(TestMazdaEpsSafety, common.LongitudinalAccelSa
       self._rx(self._button_msg())
     self._rx(self._pcm_status_msg(True))
     self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_button_window_counts_each_frame_once(self):
+    # both safety copies count CRZ_BTNS frames, each once per frame: the window is 10 frames
+    for idle, allowed in ((9, True), (10, False)):
+      with self.subTest(idle=idle):
+        self._reset_safety_hooks()
+        self._rx(self._pcm_status_msg(False))
+        self._press_set()
+        for _ in range(idle):
+          self._rx(self._button_msg())
+        self._rx(self._pcm_status_msg(True))
+        self.assertEqual(allowed, self.safety.get_controls_allowed())
 
   def test_armed_controls_latch_past_the_window(self):
     self._press_set()
@@ -467,7 +485,7 @@ class TestMazdaLongitudinalSafety(TestMazdaEpsSafety, common.LongitudinalAccelSa
         self.assertTrue(self._tx(msg))
 
 
-class MazdaTjaButtonBase(unittest.TestCase):
+class MazdaTjaButtonBase(common.SafetyTestBase):
   """MADS on, the TJA button declared (or not) through the sunnypilot safety param."""
 
   TJA_BUTTON = False
@@ -478,12 +496,16 @@ class MazdaTjaButtonBase(unittest.TestCase):
     self._init(tja_button=self.TJA_BUTTON)
 
   def _init(self, tja_button, param=0):
-    self.safety.set_current_safety_param_sp(MazdaSafetyFlagsSP.TJA_BUTTON if tja_button else 0)
+    param_sp = MazdaSafetyFlagsSP.TJA_BUTTON if tja_button else 0
+    self.safety.set_current_safety_param_sp(param_sp)
     self.safety.set_safety_hooks(CarParams.SafetyModel.mazda, param)
     self.safety.init_tests()
+    # init_tests clears it: keep the param the hooks were built from, so _reset_safety_hooks rebuilds them
+    self.safety.set_current_safety_param_sp(param_sp)
     self.safety.set_mads_params(True, False, False)
 
   def tearDown(self):
+    super().tearDown()
     self.safety.set_current_safety_param_sp(0)
     self.safety.set_mads_params(False, False, False)
 
@@ -587,7 +609,7 @@ class TestMazdaMainOnMads(MazdaTjaButtonBase):
   def _expire_lateral(self):
     self.safety.set_heartbeat_engaged_mads(False)
     for _ in range(3):
-      self.safety.mads_heartbeat_engaged_check()
+      self.safety.mads_heartbeat_check()
     self.assertFalse(self.safety.get_controls_allowed_lateral())
 
   def test_on_rearms_standby_without_engaging_cruise(self):
@@ -645,7 +667,7 @@ class TestMazdaMainOnMads(MazdaTjaButtonBase):
     self.assertTrue(self.safety.get_controls_allowed_lateral())
 
 
-class TestMazdaIgnition(unittest.TestCase):
+class TestMazdaIgnition(common.SafetyTestBase):
   TX_MSGS: list = []
 
   def setUp(self):
@@ -685,6 +707,12 @@ class TestMazdaMrccOffCleanup(MazdaTjaButtonBase):
 
   def test_exact_tap_allowed_declared_and_armed(self):
     # not controlling: this is the whole point of the exception
+    self.safety.safety_rx_hook(self._pedals(True))
+    self.assertTrue(self.safety.safety_tx_hook(self._mrcc_off()))
+
+  def test_exact_tap_allowed_after_reset_safety_hooks(self):
+    # rebuilt from the same declaration
+    self._reset_safety_hooks()
     self.safety.safety_rx_hook(self._pedals(True))
     self.assertTrue(self.safety.safety_tx_hook(self._mrcc_off()))
 
@@ -762,6 +790,7 @@ class TestMazdaNonMrcc(unittest.TestCase):
     self.safety.set_mads_params(True, False, False)
 
   def tearDown(self):
+    assert_copies_agree(self)
     self.safety.set_current_safety_param_sp(0)
     self.safety.set_mads_params(False, False, False)
 
@@ -812,7 +841,7 @@ class TestMazdaNonMrcc(unittest.TestCase):
       self._feed(*self.REQUIRED)
       if camera:
         self._feed_cam_crz_ctrl()
-      self.safety.safety_tick_current_safety_config()
+      self.safety.safety_tick()
 
   def test_declared_survives_crz_ctrl_going_stale(self):
     self._init(non_mrcc=True)
@@ -865,6 +894,7 @@ class TestMazdaNonMrccCrzCtrlRelay(unittest.TestCase):
     self._init(non_mrcc=True)
 
   def tearDown(self):
+    assert_copies_agree(self)
     self.safety.set_current_safety_param_sp(0)
     self.safety.set_mads_params(False, False, False)
 
@@ -956,6 +986,7 @@ class TestMazdaNonMrccTrafficSignsRelay(unittest.TestCase):
     self._init(non_mrcc=True)
 
   def tearDown(self):
+    assert_copies_agree(self)
     self.safety.set_current_safety_param_sp(0)
     self.safety.set_mads_params(False, False, False)
 
@@ -1055,6 +1086,7 @@ class TestMazdaNonMrccAutoHoldPress(unittest.TestCase):
     self._init(non_mrcc=True)
 
   def tearDown(self):
+    assert_copies_agree(self)
     self.safety.set_current_safety_param_sp(0)
     self.safety.set_mads_params(False, False, False)
 
